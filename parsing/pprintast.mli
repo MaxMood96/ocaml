@@ -24,6 +24,8 @@
 type space_formatter = (unit, Format.formatter, unit) format
 
 val longident : Format.formatter -> Longident.t -> unit
+val constr : Format.formatter -> Longident.t -> unit
+
 val expression : Format.formatter -> Parsetree.expression -> unit
 val string_of_expression : Parsetree.expression -> string
 
@@ -59,3 +61,14 @@ val tyvar: Format.formatter -> string -> unit
   (** Print a type variable name as a valid identifier, taking care of the
       special treatment required for the single quote character in second
       position, or for keywords by escaping them with \#. No-op on "_". *)
+
+(** {!Format_doc} functions for error messages *)
+module Doc:sig
+  val longident: Longident.t Format_doc.printer
+  val constr: Longident.t Format_doc.printer
+  val tyvar: string Format_doc.printer
+
+  (** Returns a format document if the expression reads nicely as the subject
+      of a sentence in a error message. *)
+  val nominal_exp : Parsetree.expression -> Format_doc.t option
+end

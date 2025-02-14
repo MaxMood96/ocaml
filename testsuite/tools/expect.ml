@@ -66,7 +66,7 @@ let match_expect_extension (ext : Parsetree.extension) =
     in
     let string_constant (e : Parsetree.expression) =
       match e.pexp_desc with
-      | Pexp_constant (Pconst_string (str, _, Some tag)) ->
+      | Pexp_constant {pconst_desc = Pconst_string (str, _, Some tag); _} ->
         { str; tag }
       | _ -> invalid_payload ()
     in
@@ -76,8 +76,9 @@ let match_expect_extension (ext : Parsetree.extension) =
         let normal, principal =
           match e.pexp_desc with
           | Pexp_tuple
-              [ a
-              ; { pexp_desc = Pexp_construct
+              [ None, a
+              ; None,
+                { pexp_desc = Pexp_construct
                                 ({ txt = Lident "Principal"; _ }, Some b) }
               ] ->
             (string_constant a, string_constant b)
@@ -215,6 +216,13 @@ function
   | (Ptop_dir _  | Ptop_def []) :: l -> min_line_number l
   | Ptop_def (st :: _) :: _ -> Some st.pstr_loc.loc_start.pos_lnum
 
+
+let visible_inline_code () =
+  let open Misc.Style in
+  let default = get_styles () in
+  let inline_code = { ansi = []; text_open = {|"|}; text_close={|"|} } in
+  set_styles { default with inline_code }
+
 let eval_expect_file _fname ~file_contents =
   Warnings.reset_fatal ();
   let chunks, trailing_code =
@@ -222,7 +230,9 @@ let eval_expect_file _fname ~file_contents =
   in
   let buf = Buffer.create 1024 in
   let ppf = Format.formatter_of_buffer buf in
-  let () = Misc.Style.set_tag_handling ppf in
+  let () =
+    visible_inline_code ();
+    Misc.Style.set_tag_handling ppf in
   let exec_phrases phrases =
     let phrases =
       match min_line_number phrases with

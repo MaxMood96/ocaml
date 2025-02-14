@@ -18,7 +18,6 @@
 open Misc
 open Asttypes
 open Primitive
-open Types
 open Typedtree
 open Typeopt
 open Lambda
@@ -112,6 +111,14 @@ let gen_array_kind =
 
 let prim_sys_argv =
   Primitive.simple ~name:"caml_sys_argv" ~arity:1 ~alloc:true
+
+let prim_atomic_exchange =
+  Primitive.simple ~name:"caml_atomic_exchange" ~arity:2 ~alloc:false
+let prim_atomic_cas =
+  Primitive.simple ~name:"caml_atomic_cas" ~arity:3 ~alloc:false
+let prim_atomic_fetch_add =
+  Primitive.simple ~name:"caml_atomic_fetch_add" ~arity:2 ~alloc:false
+
 
 let primitives_table =
   create_hashtable 57 [
@@ -364,16 +371,16 @@ let primitives_table =
     "%greaterequal", Comparison(Greater_equal, Compare_generic);
     "%greaterthan", Comparison(Greater_than, Compare_generic);
     "%compare", Comparison(Compare, Compare_generic);
-    "%atomic_load",
-    Primitive ((Patomic_load {immediate_or_pointer=Pointer}), 1);
-    "%atomic_exchange", Primitive (Patomic_exchange, 2);
-    "%atomic_cas", Primitive (Patomic_cas, 3);
-    "%atomic_fetch_add", Primitive (Patomic_fetch_add, 2);
+    "%atomic_load", Primitive (Patomic_load, 1);
+    "%atomic_exchange", External prim_atomic_exchange;
+    "%atomic_cas", External prim_atomic_cas;
+    "%atomic_fetch_add", External prim_atomic_fetch_add;
     "%runstack", Primitive (Prunstack, 3);
     "%reperform", Primitive (Preperform, 3);
     "%perform", Primitive (Pperform, 1);
     "%resume", Primitive (Presume, 4);
     "%dls_get", Primitive (Pdls_get, 1);
+    "%poll", Primitive (Ppoll, 1);
   ]
 
 
@@ -488,13 +495,6 @@ let specialize_primitive env ty ~has_constant_constructor prim =
       let useful = List.exists (fun knd -> knd <> Pgenval) shape in
       if useful then Some (Primitive (Pmakeblock(tag, mut, Some shape), arity))
       else None
-    end
-  | Primitive (Patomic_load { immediate_or_pointer = Pointer },
-               arity), _ ->begin
-      let is_int = match is_function_type env ty with
-        | None -> Pointer
-        | Some (_p1, rhs) -> maybe_pointer_type env rhs in
-      Some (Primitive (Patomic_load {immediate_or_pointer = is_int}, arity))
     end
   | Comparison(comp, Compare_generic), p1 :: _ ->
     if (has_constant_constructor
@@ -645,7 +645,7 @@ let lambda_of_loc kind sloc =
   | Loc_FILE -> Lconst (Const_immstring file)
   | Loc_MODULE ->
     let filename = Filename.basename file in
-    let name = Env.get_unit_name () in
+    let name = Env.get_current_unit_name () in
     let module_name = if name = "" then "//"^filename^"//" else name in
     Lconst (Const_immstring module_name)
   | Loc_LOC ->
@@ -813,7 +813,7 @@ let lambda_primitive_needs_event_after = function
   | Pbigstring_load_16 _ | Pbigstring_load_32 _ | Pbigstring_load_64 _
   | Pbigstring_set_16 _ | Pbigstring_set_32 _ | Pbigstring_set_64 _
   | Prunstack | Pperform | Preperform | Presume
-  | Pbbswap _ -> true
+  | Pbbswap _ | Ppoll -> true
 
   | Pbytes_to_string | Pbytes_of_string | Pignore | Psetglobal _
   | Pgetglobal _ | Pmakeblock _ | Pfield _ | Pfield_computed | Psetfield _
@@ -825,7 +825,7 @@ let lambda_primitive_needs_event_after = function
   | Pfloatcomp _ | Pstringlength | Pstringrefu | Pbyteslength | Pbytesrefu
   | Pbytessetu | Pmakearray ((Pintarray | Paddrarray | Pfloatarray), _)
   | Parraylength _ | Parrayrefu _ | Parraysetu _ | Pisint | Pisout
-  | Patomic_exchange | Patomic_cas | Patomic_fetch_add | Patomic_load _
+  | Patomic_load
   | Pintofbint _ | Pctconst _ | Pbswap16 | Pint_as_pointer | Popaque | Pdls_get
       -> false
 
@@ -869,10 +869,10 @@ let transl_primitive_application loc p env ty path exp args arg_exps =
 
 (* Error report *)
 
-open Format
+open Format_doc
 module Style = Misc.Style
 
-let report_error ppf = function
+let report_error_doc ppf = function
   | Unknown_builtin_primitive prim_name ->
       fprintf ppf "Unknown builtin primitive %a" Style.inline_code prim_name
   | Wrong_arity_builtin_primitive prim_name ->
@@ -883,7 +883,9 @@ let () =
   Location.register_error_of_exn
     (function
       | Error (loc, err) ->
-          Some (Location.error_of_printer ~loc report_error err)
+          Some (Location.error_of_printer ~loc report_error_doc err)
       | _ ->
         None
     )
+
+let report_error = Format_doc.compat report_error_doc

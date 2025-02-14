@@ -16,11 +16,8 @@
 (* Environment handling *)
 
 open Types
+open Data_types
 open Misc
-
-val register_uid : Uid.t -> Location.t -> unit
-
-val get_uid_to_loc_tbl : unit -> Location.t Types.Uid.Tbl.t
 
 type value_unbound_reason =
   | Val_unbound_instance_variable
@@ -29,7 +26,8 @@ type value_unbound_reason =
   | Val_unbound_ghost_recursive of Location.t
 
 type module_unbound_reason =
-  | Mod_unbound_illegal_recursion
+  | Mod_unbound_illegal_recursion of
+      { container : string option; unbound: string }
 
 type summary =
     Env_empty
@@ -185,7 +183,14 @@ type lookup_error =
   | Functor_used_as_structure of Longident.t
   | Abstract_used_as_structure of Longident.t
   | Generative_used_as_applicative of Longident.t
-  | Illegal_reference_to_recursive_module
+  | Illegal_reference_to_recursive_module of
+      { container : string option; unbound : string }
+  | Illegal_reference_to_recursive_class_type of
+      { container : string option;
+        unbound : string;
+        unbound_class_type : Longident.t;
+        container_class_type : string
+      }
   | Cannot_scrape_alias of Longident.t * Path.t
 
 val lookup_error: Location.t -> t -> lookup_error -> 'a
@@ -300,9 +305,11 @@ val make_copy_of_types: t -> (t -> t)
 
 val add_value:
     ?check:(string -> Warnings.t) -> Ident.t -> value_description -> t -> t
-val add_type: check:bool -> Ident.t -> type_declaration -> t -> t
+val add_type:
+  check:bool -> ?shape:Shape.t -> Ident.t -> type_declaration -> t -> t
 val add_extension:
-  check:bool -> rebind:bool -> Ident.t -> extension_constructor -> t -> t
+  check:bool -> ?shape:Shape.t -> rebind:bool -> Ident.t ->
+  extension_constructor -> t -> t
 val add_module: ?arg:bool -> ?shape:Shape.t ->
   Ident.t -> module_presence -> module_type -> t -> t
 val add_module_lazy: update_summary:bool ->
@@ -396,9 +403,10 @@ val reset_cache: unit -> unit
 (* To be called before each toplevel phrase. *)
 val reset_cache_toplevel: unit -> unit
 
-(* Remember the name of the current compilation unit. *)
-val set_unit_name: string -> unit
-val get_unit_name: unit -> string
+(* Remember the current compilation unit. *)
+val set_current_unit: Unit_info.t -> unit
+val get_current_unit : unit -> Unit_info.t option
+val get_current_unit_name: unit -> string
 
 (* Read, save a signature to/from a file *)
 val read_signature: Unit_info.Artifact.t -> signature
@@ -449,12 +457,14 @@ type error =
 
 exception Error of error
 
-open Format
 
-val report_error: formatter -> error -> unit
+val report_error: error Format_doc.format_printer
+val report_error_doc: error Format_doc.printer
 
-val report_lookup_error: Location.t -> t -> formatter -> lookup_error -> unit
-
+val report_lookup_error:
+  Location.t -> t -> lookup_error Format_doc.format_printer
+val report_lookup_error_doc:
+  Location.t -> t -> lookup_error Format_doc.printer
 val in_signature: bool -> t -> t
 
 val is_in_signature: t -> bool
@@ -484,9 +494,7 @@ val strengthen:
 (* Forward declaration to break mutual recursion with Ctype. *)
 val same_constr: (t -> type_expr -> type_expr -> bool) ref
 (* Forward declaration to break mutual recursion with Printtyp. *)
-val print_longident: (Format.formatter -> Longident.t -> unit) ref
-(* Forward declaration to break mutual recursion with Printtyp. *)
-val print_path: (Format.formatter -> Path.t -> unit) ref
+val print_path: Path.t Format_doc.printer ref
 
 
 (** Folds *)

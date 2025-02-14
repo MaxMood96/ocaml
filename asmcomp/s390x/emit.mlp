@@ -47,7 +47,7 @@ let slot_offset env loc cls =
 (* Output function call *)
 
 let emit_call s =
-  if !pic_code then
+  if !Clflags.pic_code then
    `	brasl	%r14, {emit_symbol s}@PLT\n`
   else
    `	brasl	%r14, {emit_symbol s}\n`
@@ -63,9 +63,10 @@ let emit_label lbl =
 
 let data_space = "	.section \".data\"\n"
 
-let code_space = "	.section \".text\"\n"
-
 let rodata_space = "	.section \".rodata\"\n"
+
+let emit_named_text_section func_name =
+  Emitaux.emit_named_text_section func_name '@'
 
 (* Output a pseudo-register *)
 
@@ -120,8 +121,8 @@ let emit_stack env r =
 (* Output a load of the address of a global symbol *)
 
 let emit_load_symbol_addr reg s =
-  if !pic_code then
-  `	lgrl	{emit_reg reg}, {emit_symbol s}@GOTENT\n`
+  if !Clflags.pic_code then
+  `	lgrl	{emit_reg reg}, {emit_symbol s}@GOT\n`
   else
   `	larl	{emit_reg reg}, {emit_symbol s}\n`
 
@@ -359,7 +360,7 @@ let emit_instr env i =
           if env.f.fun_frame_required then
             `	lg	%r14, {emit_int(n - size_addr)}(%r15)\n`;
           emit_stack_adjust (-n);
-          if !pic_code then
+          if !Clflags.pic_code then
             `	brcl	15, {emit_symbol func}@PLT\n`
           else
             `	brcl	15, {emit_symbol func}\n`
@@ -383,7 +384,7 @@ let emit_instr env i =
           cfi_def_cfa_register "%r12";
           (* NB: gdb has asserts on contiguous stacks that mean it
              will not unwind through this unless we were to tag this
-             calling frame with cfi_signal_frame in it's definition. *)
+             calling frame with cfi_signal_frame in its definition. *)
           let offset = Domainstate.(idx_of_field Domain_c_stack) * 8 in
           `	lg	%r15, {emit_int offset}(%r10)\n`;
           emit_call func;
@@ -595,9 +596,11 @@ let emit_instr env i =
         let ofs = Domainstate.(idx_of_field Domain_dls_root) * 8 in
         `	lg	{emit_reg i.res.(0)}, {emit_int ofs}(%r10)\n`
     | Lop (Ireturn_addr) ->
-        invalid_arg (
-          "Support for Ireturn_addr is not implemented on architecture "
-          ^ Config.architecture)
+        let n = frame_size env in
+        if env.f.fun_frame_required then
+            `	lg	{emit_reg i.res.(0)}, {emit_int(n - size_addr)}(%r15)\n`
+        else
+            `	lgr	{emit_reg i.res.(0)}, %r14\n`
     | Lreloadretaddr ->
         let n = frame_size env in
         `	lg	%r14, {emit_int(n - size_addr)}(%r15)\n`
@@ -664,7 +667,7 @@ let emit_instr env i =
         for i = 0 to Array.length jumptbl - 1 do
           `	.long	{emit_label jumptbl.(i)} - {emit_label lbl}\n`
         done;
-        emit_string code_space
+        emit_named_text_section env.f.fun_name
     | Lentertrap ->
         ()
     | Ladjust_trap_depth { delta_traps } ->
@@ -715,8 +718,8 @@ let fundecl fundecl =
   let env = mk_env fundecl in
   `	.globl	{emit_symbol fundecl.fun_name}\n`;
   emit_debug_info fundecl.fun_dbg;
-  `	.type	{emit_symbol fundecl.fun_name}, @function\n`;
-  emit_string code_space;
+  emit_type_directive fundecl.fun_name "@function";
+  emit_named_text_section fundecl.fun_name;
   `	.align	8\n`;
   `{emit_symbol fundecl.fun_name}:\n`;
   cfi_startproc ();
@@ -760,6 +763,7 @@ let fundecl fundecl =
   end;
 
   cfi_endproc ();
+  emit_size_directive fundecl.fun_name;
   (* Emit the numeric literals *)
   if env.float_literals <> [] || env.int_literals <> [] then begin
     emit_string rodata_space;
@@ -779,7 +783,7 @@ let fundecl fundecl =
 
 let declare_global_data s =
   `	.globl	{emit_symbol s}\n`;
-  `	.type	{emit_symbol s}, @object\n`
+  emit_type_directive s "@object"
 
 let emit_item = function
     Cglobal_symbol s ->
@@ -825,14 +829,14 @@ let begin_assembly() =
   declare_global_data lbl_begin;
   `{emit_symbol lbl_begin}:\n`;
   let lbl_begin = Compilenv.make_symbol (Some "code_begin") in
-  emit_string code_space;
+  emit_named_text_section lbl_begin;
   declare_global_data lbl_begin;
   `{emit_symbol lbl_begin}:\n`
 
 let end_assembly() =
   (* Emit the end of the segments *)
-  emit_string code_space;
   let lbl_end = Compilenv.make_symbol (Some "code_end") in
+  emit_named_text_section lbl_end;
   declare_global_data lbl_end;
   `{emit_symbol lbl_end}:\n`;
   `	.long	0\n`;
@@ -862,5 +866,5 @@ let end_assembly() =
       efa_def_label = (fun l -> `{emit_label l}:\n`);
       efa_string = (fun s -> emit_bytes_directive "	.byte	" (s ^ "\000"))
      };
-   (* Mark stack as non-executable *)
-   `	.section .note.GNU-stack,\"\",%progbits\n`
+  emit_size_directive lbl;
+  emit_nonexecstack_note ()

@@ -57,16 +57,6 @@ let fmt_char_option f = function
   | None -> fprintf f "None"
   | Some c -> fprintf f "Some %c" c
 
-let fmt_constant f x =
-  match x with
-  | Pconst_integer (i,m) -> fprintf f "PConst_int (%s,%a)" i fmt_char_option m
-  | Pconst_char (c) -> fprintf f "PConst_char %02x" (Char.code c)
-  | Pconst_string (s, strloc, None) ->
-      fprintf f "PConst_string(%S,%a,None)" s fmt_location strloc
-  | Pconst_string (s, strloc, Some delim) ->
-      fprintf f "PConst_string (%S,%a,Some %S)" s fmt_location strloc delim
-  | Pconst_float (s,m) -> fprintf f "PConst_float (%s,%a)" s fmt_char_option m
-
 let fmt_mutable_flag f x =
   match x with
   | Immutable -> fprintf f "Immutable"
@@ -106,6 +96,18 @@ let line i f s (*...*) =
   fprintf f "%s" (String.make ((2*i) mod 72) ' ');
   fprintf f s (*...*)
 
+let fmt_constant i f x =
+  line i f "constant %a\n" fmt_location x.pconst_loc;
+  let i = i+1 in
+  match x.pconst_desc with
+  | Pconst_integer (j,m) -> line i f "PConst_int (%s,%a)\n" j fmt_char_option m
+  | Pconst_char c -> line i f "PConst_char %02x\n" (Char.code c)
+  | Pconst_string (s, strloc, None) ->
+      line i f "PConst_string(%S,%a,None)\n" s fmt_location strloc
+  | Pconst_string (s, strloc, Some delim) ->
+      line i f "PConst_string (%S,%a,Some %S)\n" s fmt_location strloc delim
+  | Pconst_float (s,m) -> line i f "PConst_float (%s,%a)\n" s fmt_char_option m
+
 let list i f ppf l =
   match l with
   | [] -> line i ppf "[]\n"
@@ -133,6 +135,10 @@ let arg_label i ppf = function
 let typevars ppf vs =
   List.iter (fun x -> fprintf ppf " %a" Pprintast.tyvar x.txt) vs
 
+let labeled_tuple_element f i ppf (l, ct) =
+  option i string ppf l;
+  f i ppf ct
+
 let rec core_type i ppf x =
   line i ppf "core_type %a\n" fmt_location x.ptyp_loc;
   attributes i ppf x.ptyp_attributes;
@@ -147,7 +153,7 @@ let rec core_type i ppf x =
       core_type i ppf ct2;
   | Ptyp_tuple l ->
       line i ppf "Ptyp_tuple\n";
-      list i core_type ppf l;
+      list i (labeled_tuple_element core_type) ppf l;
   | Ptyp_constr (li, l) ->
       line i ppf "Ptyp_constr %a\n" fmt_longident_loc li;
       list i core_type ppf l;
@@ -201,12 +207,16 @@ and pattern i ppf x =
   | Ppat_alias (p, s) ->
       line i ppf "Ppat_alias %a\n" fmt_string_loc s;
       pattern i ppf p;
-  | Ppat_constant (c) -> line i ppf "Ppat_constant %a\n" fmt_constant c;
+  | Ppat_constant (c) ->
+      line i ppf "Ppat_constant\n";
+      fmt_constant i ppf c;
   | Ppat_interval (c1, c2) ->
-      line i ppf "Ppat_interval %a..%a\n" fmt_constant c1 fmt_constant c2;
-  | Ppat_tuple (l) ->
-      line i ppf "Ppat_tuple\n";
-      list i pattern ppf l;
+      line i ppf "Ppat_interval\n";
+      fmt_constant i ppf c1;
+      fmt_constant i ppf c2;
+  | Ppat_tuple (l, c) ->
+      line i ppf "Ppat_tuple\n %a\n" fmt_closed_flag c;
+      list i (labeled_tuple_element pattern) ppf l;
   | Ppat_construct (li, po) ->
       line i ppf "Ppat_construct %a\n" fmt_longident_loc li;
       option i
@@ -242,6 +252,10 @@ and pattern i ppf x =
   | Ppat_exception p ->
       line i ppf "Ppat_exception\n";
       pattern i ppf p
+  | Ppat_effect(p1, p2) ->
+      line i ppf "Ppat_effect\n";
+      pattern i ppf p1;
+      pattern i ppf p2
   | Ppat_open (m,p) ->
       line i ppf "Ppat_open \"%a\"\n" fmt_longident_loc m;
       pattern i ppf p
@@ -255,7 +269,9 @@ and expression i ppf x =
   let i = i+1 in
   match x.pexp_desc with
   | Pexp_ident (li) -> line i ppf "Pexp_ident %a\n" fmt_longident_loc li;
-  | Pexp_constant (c) -> line i ppf "Pexp_constant %a\n" fmt_constant c;
+  | Pexp_constant (c) ->
+      line i ppf "Pexp_constant\n";
+      fmt_constant i ppf c;
   | Pexp_let (rf, l, e) ->
       line i ppf "Pexp_let %a\n" fmt_rec_flag rf;
       list i value_binding ppf l;
@@ -279,7 +295,7 @@ and expression i ppf x =
       list i case ppf l;
   | Pexp_tuple (l) ->
       line i ppf "Pexp_tuple\n";
-      list i expression ppf l;
+      list i (labeled_tuple_element expression) ppf l;
   | Pexp_construct (li, eo) ->
       line i ppf "Pexp_construct %a\n" fmt_longident_loc li;
       option i expression ppf eo;

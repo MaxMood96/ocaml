@@ -22,6 +22,7 @@
 *)
 
 open Asttypes
+module Uid = Shape.Uid
 
 (* Value expressions for the core language *)
 
@@ -77,20 +78,24 @@ and 'k pattern_desc =
   (* value patterns *)
   | Tpat_any : value pattern_desc
         (** _ *)
-  | Tpat_var : Ident.t * string loc -> value pattern_desc
+  | Tpat_var : Ident.t * string loc * Uid.t -> value pattern_desc
         (** x *)
   | Tpat_alias :
-      value general_pattern * Ident.t * string loc -> value pattern_desc
+      value general_pattern * Ident.t * string loc * Uid.t * Types.type_expr ->
+      value pattern_desc
         (** P as a *)
   | Tpat_constant : constant -> value pattern_desc
         (** 1, 'a', "true", 1.0, 1l, 1L, 1n *)
-  | Tpat_tuple : value general_pattern list -> value pattern_desc
-        (** (P1, ..., Pn)
+  | Tpat_tuple :
+      (string option * value general_pattern) list -> value pattern_desc
+        (** (P1, ..., Pn)                  [(None,P1); ...; (None,Pn)])
+            (L1:P1, ... Ln:Pn)             [(Some L1,P1); ...; (Some Ln,Pn)])
+            Any mix, e.g. (L1:P1, P2)      [(Some L1,P1); ...; (None,P2)])
 
             Invariant: n >= 2
          *)
   | Tpat_construct :
-      Longident.t loc * Types.constructor_description *
+      Longident.t loc * Data_types.constructor_description *
         value general_pattern list * (Ident.t loc list * core_type) option ->
       value pattern_desc
         (** C                             ([], None)
@@ -110,15 +115,18 @@ and 'k pattern_desc =
             See {!Types.row_desc} for an explanation of the last parameter.
          *)
   | Tpat_record :
-      (Longident.t loc * Types.label_description * value general_pattern) list *
-        closed_flag ->
-      value pattern_desc
+      (Longident.t loc
+       * Data_types.label_description
+       * value general_pattern
+      ) list
+      * closed_flag
+      -> value pattern_desc
         (** { l1=P1; ...; ln=Pn }     (flag = Closed)
             { l1=P1; ...; ln=Pn; _}   (flag = Open)
 
             Invariant: n > 0
          *)
-  | Tpat_array : value general_pattern list -> value pattern_desc
+  | Tpat_array : mutable_flag * value general_pattern list -> value pattern_desc
         (** [| P1; ...; Pn |] *)
   | Tpat_lazy : value general_pattern -> value pattern_desc
         (** lazy P *)
@@ -194,10 +202,10 @@ and expression_desc =
         Parameters' effects are run left-to-right when an n-ary function is
         saturated with n arguments.
     *)
-  | Texp_apply of expression * (arg_label * expression option) list
+  | Texp_apply of expression * (arg_label * apply_arg) list
         (** E0 ~l1:E1 ... ~ln:En
 
-            The expression can be None if the expression is abstracted over
+            The expression can be Omitted if the expression is abstracted over
             this argument. It currently appears when a label is applied.
 
             For example:
@@ -206,32 +214,44 @@ and expression_desc =
 
             The resulting typedtree for the application is:
             Texp_apply (Texp_ident "f/1037",
-                        [(Nolabel, None);
-                         (Labelled "y", Some (Texp_constant Const_int 3))
+                        [(Nolabel, Omitted ());
+                         (Labelled "y", Arg (Texp_constant Const_int 3))
                         ])
          *)
-  | Texp_match of expression * computation case list * partial
+  | Texp_match of expression * computation case list * value case list * partial
         (** match E0 with
             | P1 -> E1
             | P2 | exception P3 -> E2
             | exception P4 -> E3
+            | effect P4 k -> E4
 
             [Texp_match (E0, [(P1, E1); (P2 | exception P3, E2);
-                              (exception P4, E3)], _)]
+                              (exception P4, E3)], [(P4, E4)],  _)]
          *)
-  | Texp_try of expression * value case list
-        (** try E with P1 -> E1 | ... | PN -> EN *)
-  | Texp_tuple of expression list
-        (** (E1, ..., EN) *)
+  | Texp_try of expression * value case list * value case list
+         (** try E with
+            | P1 -> E1
+            | effect P2 k -> E2
+            [Texp_try (E, [(P1, E1)], [(P2, E2)])]
+          *)
+  | Texp_tuple of (string option * expression) list
+        (** [Texp_tuple(el)] represents
+            - [(E1, ..., En)]
+                 when [el] is [(None, E1);...;(None, En)],
+            - [(L1:E1, ..., Ln:En)]
+                 when [el] is [(Some L1, E1);...;(Some Ln, En)],
+            - Any mix, e.g. [(L1: E1, E2)]
+                 when [el] is [(Some L1, E1); (None, E2)]
+          *)
   | Texp_construct of
-      Longident.t loc * Types.constructor_description * expression list
+      Longident.t loc * Data_types.constructor_description * expression list
         (** C                []
             C E              [E]
             C (E1, ..., En)  [E1;...;En]
          *)
   | Texp_variant of label * expression option
   | Texp_record of {
-      fields : ( Types.label_description * record_label_definition ) array;
+      fields : ( Data_types.label_description * record_label_definition ) array;
       representation : Types.record_representation;
       extended_expression : expression option;
     }
@@ -246,10 +266,10 @@ and expression_desc =
               { fields = [| l1, Kept t1; l2 Override P2 |]; representation;
                 extended_expression = Some E0 }
         *)
-  | Texp_field of expression * Longident.t loc * Types.label_description
+  | Texp_field of expression * Longident.t loc * Data_types.label_description
   | Texp_setfield of
-      expression * Longident.t loc * Types.label_description * expression
-  | Texp_array of expression list
+      expression * Longident.t loc * Data_types.label_description * expression
+  | Texp_array of mutable_flag * expression list
   | Texp_ifthenelse of expression * expression * expression option
   | Texp_sequence of expression * expression
   | Texp_while of expression * expression
@@ -289,6 +309,7 @@ and meth =
 and 'k case =
     {
      c_lhs: 'k general_pattern;
+     c_cont: Ident.t option;
      c_guard: expression option;
      c_rhs: expression;
     }
@@ -357,6 +378,12 @@ and binding_op =
     bop_loc : Location.t;
   }
 
+and ('a, 'b) arg_or_omitted =
+  | Arg of 'a
+  | Omitted of 'b
+
+and apply_arg = (expression, unit) arg_or_omitted
+
 (* Value expressions for the class language *)
 
 and class_expr =
@@ -374,7 +401,7 @@ and class_expr_desc =
   | Tcl_fun of
       arg_label * pattern * (Ident.t * expression) list
       * class_expr * partial
-  | Tcl_apply of class_expr * (arg_label * expression option) list
+  | Tcl_apply of class_expr * (arg_label * apply_arg) list
   | Tcl_let of rec_flag * value_binding list *
                   (Ident.t * expression) list * class_expr
   | Tcl_constraint of
@@ -479,6 +506,7 @@ and module_binding =
     {
      mb_id: Ident.t option; (** [None] for [module _ = struct ... end] *)
      mb_name: string option loc;
+     mb_uid: Uid.t;
      mb_presence: Types.module_presence;
      mb_expr: module_expr;
      mb_attributes: attributes;
@@ -570,6 +598,7 @@ and module_declaration =
     {
      md_id: Ident.t option;
      md_name: string option loc;
+     md_uid: Uid.t;
      md_presence: Types.module_presence;
      md_type: module_type;
      md_attributes: attributes;
@@ -580,6 +609,7 @@ and module_substitution =
     {
      ms_id: Ident.t;
      ms_name: string loc;
+     ms_uid: Uid.t;
      ms_manifest: Path.t;
      ms_txt: Longident.t loc;
      ms_attributes: attributes;
@@ -590,6 +620,7 @@ and module_type_declaration =
     {
      mtd_id: Ident.t;
      mtd_name: string loc;
+     mtd_uid: Uid.t;
      mtd_type: module_type option;
      mtd_attributes: attributes;
      mtd_loc: Location.t;
@@ -644,7 +675,7 @@ and core_type_desc =
     Ttyp_any
   | Ttyp_var of string
   | Ttyp_arrow of arg_label * core_type * core_type
-  | Ttyp_tuple of core_type list
+  | Ttyp_tuple of (string option * core_type) list
   | Ttyp_constr of Path.t * Longident.t loc * core_type list
   | Ttyp_object of object_field list * closed_flag
   | Ttyp_class of Path.t * Longident.t loc * core_type list
@@ -715,6 +746,7 @@ and label_declaration =
     {
      ld_id: Ident.t;
      ld_name: string loc;
+     ld_uid: Uid.t;
      ld_mutable: mutable_flag;
      ld_type: core_type;
      ld_loc: Location.t;
@@ -725,6 +757,7 @@ and constructor_declaration =
     {
      cd_id: Ident.t;
      cd_name: string loc;
+     cd_uid: Uid.t;
      cd_vars: string loc list;
      cd_args: constructor_arguments;
      cd_res: core_type option;
@@ -841,6 +874,23 @@ type implementation = {
     structure.
 *)
 
+type item_declaration =
+  | Value of value_description
+  | Value_binding of value_binding
+  | Type of type_declaration
+  | Constructor of constructor_declaration
+  | Extension_constructor of extension_constructor
+  | Label of label_declaration
+  | Module of module_declaration
+  | Module_substitution of module_substitution
+  | Module_binding of module_binding
+  | Module_type of module_type_declaration
+  | Class of class_declaration
+  | Class_type of class_type_declaration
+(** [item_declaration] groups together items that correspond to the syntactic
+    category of "declarations" which include types, values, modules, etc.
+    declarations in signatures and their definitions in implementations. *)
+
 (* Auxiliary functions over the a.s.t. *)
 
 (** [as_computation_pattern p] is a computation pattern with description
@@ -871,7 +921,8 @@ val exists_pattern: (pattern -> bool) -> pattern -> bool
 
 val let_bound_idents: value_binding list -> Ident.t list
 val let_bound_idents_full:
-    value_binding list -> (Ident.t * string loc * Types.type_expr) list
+    value_binding list ->
+    (Ident.t * string loc * Types.type_expr * Types.Uid.t) list
 
 (** Alpha conversion of patterns *)
 val alpha_pat:
@@ -882,12 +933,12 @@ val mkloc: 'a -> Location.t -> 'a Asttypes.loc
 
 val pat_bound_idents: 'k general_pattern -> Ident.t list
 val pat_bound_idents_full:
-  'k general_pattern -> (Ident.t * string loc * Types.type_expr) list
+  'k general_pattern ->
+  (Ident.t * string loc * Types.type_expr * Types.Uid.t) list
 
 (** Splits an or pattern into its value (left) and exception (right) parts. *)
 val split_pattern:
   computation general_pattern -> pattern option * pattern option
 
-(** Whether an expression looks nice as the subject of a sentence in a error
-    message. *)
-val exp_is_nominal : expression -> bool
+val map_apply_arg:
+  ('a -> ' b) -> ('a, 'omitted) arg_or_omitted ->  ('b, 'omitted) arg_or_omitted

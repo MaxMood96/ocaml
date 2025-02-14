@@ -20,8 +20,6 @@
 
 (* Machine-specific command-line options *)
 
-val pic_code : bool ref
-
 val command_line_options : (string * Arg.spec * string) list
 
 (* Specific operations *)
@@ -57,8 +55,6 @@ val division_crashes_on_overflow : bool
 val identity_addressing : addressing_mode
 
 val offset_addressing : addressing_mode -> int -> addressing_mode
-
-val num_args_addressing : addressing_mode -> int
 
 (* Printing operations and addressing modes *)
 

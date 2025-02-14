@@ -37,7 +37,7 @@ module Global : sig
     | Glob_compunit of compunit
     | Glob_predef of predef
   val name: t -> string
-  val description: Format.formatter -> t -> unit
+  val description: t Format_doc.printer
   val of_ident: Ident.t -> t option
   module Set : Set.S with type elt = t
   module Map : Map.S with type key = t
@@ -55,7 +55,7 @@ val output_global_map: out_channel -> unit
 val output_primitive_names: out_channel -> unit
 val output_primitive_table: out_channel -> unit
 val data_global_map: unit -> Obj.t
-val data_primitive_names: unit -> string
+val data_primitive_names: unit -> string list
 val transl_const: Lambda.structured_constant -> Obj.t
 
 (* Functions for the toplevel *)
@@ -90,8 +90,7 @@ type error =
 
 exception Error of error
 
-open Format
-
-val report_error: formatter -> error -> unit
+val report_error: error Format_doc.format_printer
+val report_error_doc: error Format_doc.printer
 
 val reset: unit -> unit

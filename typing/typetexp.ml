@@ -46,6 +46,7 @@ type error =
   | Method_mismatch of string * type_expr * type_expr
   | Opened_object of Path.t option
   | Not_an_object of type_expr
+  | Repeated_tuple_label of string
 
 exception Error of Location.t * Env.t * error
 exception Error_forward of Location.error
@@ -218,7 +219,6 @@ end = struct
         promoted vars
 
   let check_poly_univars env loc vars =
-    vars |> List.iter (fun (_, p) -> generalize p.univar);
     let univars =
       vars |> List.map (fun (name, {univar=ty1; _ }) ->
       let v = Btype.proxy ty1 in
@@ -313,7 +313,11 @@ end = struct
         if flavor = Unification || is_in_scope name then
           let v = new_global_var () in
           let snap = Btype.snapshot () in
-          if try unify env v ty; true with _ -> Btype.backtrack snap; false
+          if try unify env v ty; true
+            with
+                Unify err when is_in_scope name ->
+                  raise (Error(loc, env, Type_mismatch err))
+              | _ -> Btype.backtrack snap; false
           then try
             r := (loc, v, lookup_global_type_variable name) :: !r
           with Not_found ->
@@ -338,6 +342,7 @@ end
 
 let transl_modtype_longident = ref (fun _ -> assert false)
 let transl_modtype = ref (fun _ -> assert false)
+let check_package_with_type_constraints = ref (fun _ -> assert false)
 
 let sort_constraints_no_duplicates loc env l =
   List.sort
@@ -347,26 +352,7 @@ let sort_constraints_no_duplicates loc env l =
        compare s1.txt s2.txt)
     l
 
-let create_package_mty loc p l =
-  List.fold_left
-    (fun mty (s, _) ->
-      let d = {ptype_name = mkloc (Longident.last s.txt) s.loc;
-               ptype_params = [];
-               ptype_cstrs = [];
-               ptype_kind = Ptype_abstract;
-               ptype_private = Asttypes.Public;
-               ptype_manifest = None;
-               ptype_attributes = [];
-               ptype_loc = loc} in
-      Ast_helper.Mty.mk ~loc
-        (Pmty_with (mty, [ Pwith_type ({ txt = s.txt; loc }, d) ]))
-    )
-    (Ast_helper.Mty.mk ~loc (Pmty_ident p))
-    l
-
 (* Translation of type expressions *)
-
-let generalize_ctyp typ = generalize typ.ctyp_type
 
 let strict_ident c = (c = '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z')
 
@@ -457,8 +443,14 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
     ctyp (Ttyp_arrow (l, cty1, cty2)) ty
   | Ptyp_tuple stl ->
     assert (List.length stl >= 2);
-    let ctys = List.map (transl_type env ~policy ~row_context) stl in
-    let ty = newty (Ttuple (List.map (fun ctyp -> ctyp.ctyp_type) ctys)) in
+    Option.iter (fun l -> raise (Error (loc, env, Repeated_tuple_label l)))
+      (Misc.repeated_label stl);
+    let ctys =
+      List.map (fun (l, t) -> l, transl_type env ~policy ~row_context t) stl
+    in
+    let ty =
+      newty (Ttuple (List.map (fun (l, ctyp) -> l, ctyp.ctyp_type) ctys))
+    in
     ctyp (Ttyp_tuple ctys) ty
   | Ptyp_constr(lid, stl) ->
       let (path, decl) = Env.lookup_type ~loc:lid.loc lid.txt env in
@@ -535,7 +527,7 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
           ty
         with Not_found ->
           let t, ty =
-            with_local_level_if_principal begin fun () ->
+            with_local_level_generalize_structure_if_principal begin fun () ->
               let t = newvar () in
               (* Use the whole location, which is used by [Type_mismatch]. *)
               TyVarEnv.remember_used alias.txt t styp.ptyp_loc;
@@ -546,7 +538,6 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
               end;
               (t, ty)
             end
-            ~post: (fun (t, _) -> generalize_structure t)
           in
           let t = instance t in
           let px = Btype.proxy t in
@@ -661,14 +652,13 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
   | Ptyp_poly(vars, st) ->
       let vars = List.map (fun v -> v.txt) vars in
       let new_univars, cty =
-        with_local_level begin fun () ->
+        with_local_level_generalize begin fun () ->
           let new_univars = TyVarEnv.make_poly_univars vars in
           let cty = TyVarEnv.with_univars new_univars begin fun () ->
             transl_type env ~policy ~row_context st
           end in
           (new_univars, cty)
         end
-        ~post:(fun (_,cty) -> generalize_ctyp cty)
       in
       let ty = cty.ctyp_type in
       let ty_list = TyVarEnv.check_poly_univars env styp.ptyp_loc new_univars in
@@ -677,21 +667,14 @@ and transl_type_aux env ~row_context ~aliased ~policy styp =
       unify_var env (newvar()) ty';
       ctyp (Ttyp_poly (vars, cty)) ty'
   | Ptyp_package (p, l) ->
-      let loc = styp.ptyp_loc in
-      let l = sort_constraints_no_duplicates loc env l in
-      let mty = create_package_mty loc p l in
-      let mty =
-        TyVarEnv.with_local_scope (fun () -> !transl_modtype env mty) in
-      let ptys = List.map (fun (s, pty) ->
-                             s, transl_type env ~policy ~row_context pty
-                          ) l in
-      let path = !transl_modtype_longident loc env p.txt in
+      let path, mty, ptys =
+        transl_package env ~policy ~row_context styp.ptyp_loc p l in
       let ty = newty (Tpackage (path,
                        List.map (fun (s, cty) -> (s.txt, cty.ctyp_type)) ptys))
       in
       ctyp (Ttyp_package {
             pack_path = path;
-            pack_type = mty.mty_type;
+            pack_type = mty;
             pack_fields = ptys;
             pack_txt = p;
            }) ty
@@ -770,10 +753,24 @@ and transl_fields env ~policy ~row_context o fields =
       newty (Tfield (s, field_public, ty', ty))) ty_init fields in
   ty, object_fields
 
+and transl_package env ~policy ~row_context loc p l =
+  let l = sort_constraints_no_duplicates loc env l in
+  let mty = Ast_helper.Mty.mk ~loc (Pmty_ident p) in
+  let mty = TyVarEnv.with_local_scope (fun () -> !transl_modtype env mty) in
+  let ptys =
+    List.map (fun (s, pty) -> s, transl_type env ~policy ~row_context pty) l
+  in
+  let mty =
+    if ptys <> [] then
+      !check_package_with_type_constraints loc env mty.mty_type ptys
+    else mty.mty_type
+  in
+  let path = !transl_modtype_longident loc env p.txt in
+  path, mty, ptys
 
 (* Make the rows "fixed" in this type, to make universal check easier *)
-let rec make_fixed_univars ty =
-  if Btype.try_mark_node ty then
+let rec make_fixed_univars mark ty =
+  if try_mark_node mark ty then
     begin match get_desc ty with
     | Tvariant row ->
         let Row {fields; more; name; closed} = row_repr row in
@@ -790,17 +787,16 @@ let rec make_fixed_univars ty =
             (Tvariant
                (create_row ~fields ~more ~name ~closed
                   ~fixed:(Some (Univar more))));
-        Btype.iter_row make_fixed_univars row
+        Btype.iter_row (make_fixed_univars mark) row
     | _ ->
-        Btype.iter_type_expr make_fixed_univars ty
+        Btype.iter_type_expr (make_fixed_univars mark) ty
     end
+
+let make_fixed_univars ty =
+  with_type_mark (fun mark -> make_fixed_univars mark ty)
 
 let transl_type env policy styp =
   transl_type env ~policy ~row_context:[] styp
-
-let make_fixed_univars ty =
-  make_fixed_univars ty;
-  Btype.unmark_type ty
 
 let transl_simple_type env ?univars ~closed styp =
   TyVarEnv.reset_locals ?univars ();
@@ -814,7 +810,7 @@ let transl_simple_type_univars env styp =
   TyVarEnv.reset_locals ();
   let typ, univs =
     TyVarEnv.collect_univars begin fun () ->
-      with_local_level ~post:generalize_ctyp begin fun () ->
+      with_local_level_generalize begin fun () ->
         let policy = TyVarEnv.univars_policy in
         let typ = transl_type env policy styp in
         TyVarEnv.globalize_used_variables policy env ();
@@ -828,7 +824,7 @@ let transl_simple_type_univars env styp =
 let transl_simple_type_delayed env styp =
   TyVarEnv.reset_locals ();
   let typ, force =
-    with_local_level begin fun () ->
+    with_local_level_generalize begin fun () ->
       let policy = TyVarEnv.extensible_policy in
       let typ = transl_type env policy styp in
       make_fixed_univars typ.ctyp_type;
@@ -838,8 +834,6 @@ let transl_simple_type_delayed env styp =
       let force = TyVarEnv.globalize_used_variables policy env in
       (typ, force)
     end
-    (* Generalize everything except the variables that were just globalized. *)
-    ~post:(fun (typ,_) -> generalize_ctyp typ)
   in
   (typ, instance typ.ctyp_type, force)
 
@@ -848,13 +842,12 @@ let transl_type_scheme env styp =
   | Ptyp_poly (vars, st) ->
      let vars = List.map (fun v -> v.txt) vars in
      let univars, typ =
-       with_local_level begin fun () ->
+       with_local_level_generalize begin fun () ->
          TyVarEnv.reset ();
          let univars = TyVarEnv.make_poly_univars vars in
          let typ = transl_simple_type env ~univars ~closed:true st in
          (univars, typ)
        end
-       ~post:(fun (_,typ) -> generalize_ctyp typ)
      in
      let _ = TyVarEnv.instance_poly_univars env styp.ptyp_loc univars in
      { ctyp_desc = Ttyp_poly (vars, typ);
@@ -863,20 +856,20 @@ let transl_type_scheme env styp =
        ctyp_loc = styp.ptyp_loc;
        ctyp_attributes = styp.ptyp_attributes }
   | _ ->
-      with_local_level
+      with_local_level_generalize
         (fun () -> TyVarEnv.reset (); transl_simple_type env ~closed:false styp)
-        ~post:generalize_ctyp
 
 
 (* Error report *)
 
-open Format
-open Printtyp
+open Format_doc
+open Printtyp.Doc
 module Style = Misc.Style
-let pp_tag ppf t = Format.fprintf ppf "`%s" t
+let pp_tag ppf t = fprintf ppf "`%s" t
+let pp_out_type ppf ty = Style.as_inline_code !Oprint.out_type ppf ty
+let pp_type ppf ty = Style.as_inline_code Printtyp.Doc.type_expr ppf ty
 
-
-let report_error env ppf = function
+let report_error_doc env ppf = function
   | Unbound_type_variable (name, in_scope_names) ->
     fprintf ppf "The type variable %a is unbound in this type declaration.@ %a"
       Style.inline_code name
@@ -894,21 +887,19 @@ let report_error env ppf = function
       (Style.as_inline_code longident) lid expected provided
   | Bound_type_variable name ->
       fprintf ppf "Already bound type parameter %a"
-        (Style.as_inline_code Pprintast.tyvar) name
+        (Style.as_inline_code Pprintast.Doc.tyvar) name
   | Recursive_type ->
     fprintf ppf "This type is recursive"
   | Type_mismatch trace ->
-      Printtyp.report_unification_error ppf Env.empty trace
-        (function ppf ->
-           fprintf ppf "This type")
-        (function ppf ->
-           fprintf ppf "should be an instance of type")
+      let msg = Format_doc.Doc.msg in
+      Errortrace_report.unification ppf Env.empty trace
+        (msg "This type")
+        (msg "should be an instance of type")
   | Alias_type_mismatch trace ->
-      Printtyp.report_unification_error ppf Env.empty trace
-        (function ppf ->
-           fprintf ppf "This alias is bound to type")
-        (function ppf ->
-           fprintf ppf "but is used as an instance of type")
+      let msg = Format_doc.Doc.msg in
+      Errortrace_report.unification ppf Env.empty trace
+        (msg "This alias is bound to type")
+        (msg "but is used as an instance of type")
   | Present_has_conjunction l ->
       fprintf ppf "The present constructor %a has a conjunctive type"
         Style.inline_code l
@@ -925,18 +916,17 @@ let report_error env ppf = function
         Style.inline_code ">"
         (Style.as_inline_code pp_tag) l
   | Constructor_mismatch (ty, ty') ->
-      let pp_type ppf ty = Style.as_inline_code !Oprint.out_type ppf ty in
       wrap_printing_env ~error:true env (fun ()  ->
-        Printtyp.prepare_for_printing [ty; ty'];
+        Out_type.prepare_for_printing [ty; ty'];
         fprintf ppf "@[<hov>%s %a@ %s@ %a@]"
           "This variant type contains a constructor"
-          pp_type (tree_of_typexp Type ty)
+          pp_out_type (Out_type.tree_of_typexp Type ty)
           "which should be"
-          pp_type (tree_of_typexp Type ty'))
+          pp_out_type (Out_type.tree_of_typexp Type ty'))
   | Not_a_variant ty ->
       fprintf ppf
         "@[The type %a@ does not expand to a polymorphic variant type@]"
-        (Style.as_inline_code Printtyp.type_expr) ty;
+        pp_type ty;
       begin match get_desc ty with
         | Tvar (Some s) ->
            (* PR#7012: help the user that wrote 'Foo instead of `Foo *)
@@ -955,14 +945,13 @@ let report_error env ppf = function
   | Cannot_quantify (name, v) ->
       fprintf ppf
         "@[<hov>The universal type variable %a cannot be generalized:@ "
-        (Style.as_inline_code Pprintast.tyvar) name;
+        (Style.as_inline_code Pprintast.Doc.tyvar) name;
       if Btype.is_Tvar v then
         fprintf ppf "it escapes its scope"
       else if Btype.is_Tunivar v then
         fprintf ppf "it is already bound to another variable"
       else
-        fprintf ppf "it is bound to@ %a"
-          (Style.as_inline_code Printtyp.type_expr) v;
+        fprintf ppf "it is bound to@ %a" pp_type v;
       fprintf ppf ".@]";
   | Multiple_constraints_on_type s ->
       fprintf ppf "Multiple constraints for type %a"
@@ -971,8 +960,8 @@ let report_error env ppf = function
       wrap_printing_env ~error:true env (fun ()  ->
         fprintf ppf "@[<hov>Method %a has type %a,@ which should be %a@]"
           Style.inline_code l
-          (Style.as_inline_code Printtyp.type_expr) ty
-          (Style.as_inline_code Printtyp.type_expr) ty')
+          pp_type ty
+          pp_type ty')
   | Opened_object nm ->
       fprintf ppf
         "Illegal open object type%a"
@@ -981,15 +970,20 @@ let report_error env ppf = function
            | None -> fprintf ppf "") nm
   | Not_an_object ty ->
       fprintf ppf "@[The type %a@ is not an object type@]"
-        (Style.as_inline_code Printtyp.type_expr) ty
+        pp_type ty
+  | Repeated_tuple_label l ->
+      fprintf ppf "@[This tuple type has two labels named %a@]"
+        Style.inline_code l
 
 let () =
   Location.register_error_of_exn
     (function
       | Error (loc, env, err) ->
-        Some (Location.error_of_printer ~loc (report_error env) err)
+        Some (Location.error_of_printer ~loc (report_error_doc env) err)
       | Error_forward err ->
         Some err
       | _ ->
         None
     )
+
+let report_error = Format_doc.compat1 report_error_doc

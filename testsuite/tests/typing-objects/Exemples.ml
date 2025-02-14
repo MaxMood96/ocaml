@@ -207,7 +207,7 @@ let c'' = new color_circle p;;
 Line 1, characters 27-28:
 1 | let c'' = new color_circle p;;
                                ^
-Error: This expression has type "point" but an expression was expected of type
+Error: The value "p" has type "point" but an expression was expected of type
          "#color_point"
        The first object type has no method "color"
 |}];;
@@ -290,8 +290,8 @@ end;;
 Line 3, characters 2-36:
 3 |   inherit printable_point y as super
       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Warning 13 [instance-variable-override]: the following instance variables are overridden by the class printable_point :
-  x
+Warning 13 [instance-variable-override]: the following instance variables
+  are overridden by the class "printable_point": "x"
 
 class printable_color_point :
   int ->
@@ -588,7 +588,7 @@ l#add (c3 :> int_comparable);;
 Line 1, characters 25-27:
 1 | (new sorted_list ())#add c3;;
                              ^^
-Error: This expression has type
+Error: The value "c3" has type
          "int_comparable3" =
            "< cmp : int_comparable -> int; setx : int -> unit; x : int >"
        but an expression was expected of type

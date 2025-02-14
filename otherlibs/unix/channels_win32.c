@@ -19,6 +19,7 @@
 #include <caml/alloc.h>
 #include <caml/io.h>
 #include <caml/memory.h>
+#include <caml/platform.h>
 #include "caml/unixsupport.h"
 #include <fcntl.h>
 #include <io.h>
@@ -101,7 +102,6 @@ CAMLprim value caml_unix_inchannel_of_filedescr(value handle)
   CAMLlocal1(vchan);
   int flags = 0;
   int fd;
-  struct channel * chan;
   DWORD err;
 
   err = check_stream_semantics(handle);
@@ -122,7 +122,6 @@ CAMLprim value caml_unix_outchannel_of_filedescr(value handle)
   CAMLlocal1(vchan);
   int fd;
   int flags = 0;
-  struct channel * chan;
   DWORD err;
 
   err = check_stream_semantics(handle);

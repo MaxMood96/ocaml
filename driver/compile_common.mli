@@ -28,15 +28,14 @@ type info = {
 val with_info :
   native:bool ->
   tool_name:string ->
-  source_file:string ->
-  output_prefix:string ->
   dump_ext:string ->
+  Unit_info.t ->
   (info -> 'a) -> 'a
-(** [with_info ~native ~tool_name ~source_file ~output_prefix ~dump_ext k]
-   invokes its continuation [k] with an [info] structure built from
-   its input, after initializing various global variables. This info
-   structure and the initialized global state are not valid anymore
-   after the continuation returns.
+(** [with_info ~native ~tool_name ~dump_ext unit_info k] invokes its
+    continuation [k] with an [info] structure passed as input, after
+    initializing various global variables. This info structure and the
+    initialized global state are not valid anymore after the continuation
+    returns.
 
    Due to current implementation limitations in the compiler, it is
    unsafe to try to compile several distinct compilation units by
@@ -48,12 +47,13 @@ val with_info :
 val parse_intf : info -> Parsetree.signature
 (** [parse_intf info] parses an interface (usually an [.mli] file). *)
 
-val typecheck_intf : info -> Parsetree.signature -> Typedtree.signature
+val typecheck_intf :
+  info -> Parsetree.signature -> Misc.alerts * Typedtree.signature
 (** [typecheck_intf info parsetree] typechecks an interface and returns
     the typedtree of the associated signature.
 *)
 
-val emit_signature : info -> Parsetree.signature -> Typedtree.signature -> unit
+val emit_signature : info -> Misc.alerts -> Typedtree.signature -> unit
 (** [emit_signature info parsetree typedtree] emits the [.cmi] file
     containing the given signature.
 *)

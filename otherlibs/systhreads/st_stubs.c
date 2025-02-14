@@ -15,13 +15,43 @@
 
 #define CAML_INTERNALS
 
-#if defined(_WIN32) && !defined(NATIVE_CODE)
+#define _GNU_SOURCE /* helps to find pthread_setname_np() */
+#include "caml/config.h"
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <processthreadsapi.h>
+#  include "caml/osdeps.h"
+
+#  if defined(HAS_SETTHREADDESCRIPTION) && \
+      !defined(HAS_DECL_SETTHREADDESCRIPTION)
+WINBASEAPI HRESULT WINAPI
+SetThreadDescription(HANDLE hThread, PCWSTR lpThreadDescription);
+#  endif
+
+#elif defined(HAS_PRCTL)
+#  include <sys/prctl.h>
+#elif defined(HAS_PTHREAD_SETNAME_NP) || defined(HAS_PTHREAD_SET_NAME_NP)
+#  include <pthread.h>
+
+#  if defined(HAS_PTHREAD_NP_H)
+#    include <pthread_np.h>
+#  endif
+#endif
+
+#include "caml/misc.h"
+
+#if defined(_WIN32) && !defined(NATIVE_CODE) && !defined(_MSC_VER)
 /* Ensure that pthread.h marks symbols __declspec(dllimport) so that they can be
    picked up from the runtime (which will have linked winpthreads statically).
    mingw-w64 11.0.0 introduced WINPTHREADS_USE_DLLIMPORT to do this explicitly;
    prior versions co-opted this on the internal DLL_EXPORT, but this is ignored
    in 11.0 and later unless IN_WINPTHREAD is also defined, so we can safely
-   define both to support both versions. */
+   define both to support both versions.
+   When compiling with MSVC, we currently link directly the winpthreads objects
+   into our runtime, so we do not want to mark its symbols with
+   __declspec(dllimport). */
 #define WINPTHREADS_USE_DLLIMPORT
 #define DLL_EXPORT
 #endif
@@ -44,18 +74,47 @@
 #include "caml/printexc.h"
 #include "caml/roots.h"
 #include "caml/signals.h"
+#include "caml/startup_aux.h"
 #include "caml/sync.h"
 #include "caml/sys.h"
 #include "caml/memprof.h"
-
-#include "../../runtime/sync_posix.h"
 
 /* "caml/threads.h" is *not* included since it contains the _external_
    declarations for the caml_c_thread_register and caml_c_thread_unregister
    functions. */
 
 /* Max computation time before rescheduling, in milliseconds */
-#define Thread_timeout 50
+#define Thread_timeout_msec 50
+
+typedef int st_retcode;
+
+static void st_bt_lock_acquire(void) {
+
+  /* We do not want to signal the backup thread if it is not "working"
+     as it may very well not be, because we could have just resumed
+     execution from another thread right away. */
+  if (caml_bt_is_in_blocking_section()) {
+    caml_bt_enter_ocaml();
+  }
+
+  caml_acquire_domain_lock();
+
+  return;
+}
+
+static void st_bt_lock_release(bool other_threads_waiting) {
+
+  /* Here we do want to signal the backup thread iff there's
+     no thread waiting to be scheduled, and the backup thread is currently
+     idle. */
+  if (other_threads_waiting && caml_bt_is_in_blocking_section() == 0) {
+    caml_bt_exit_ocaml();
+  }
+
+  caml_release_domain_lock();
+
+  return;
+}
 
 /* OS-specific code */
 #ifdef _WIN32
@@ -115,10 +174,11 @@ struct caml_thread_table {
   st_masterlock thread_lock;
   int tick_thread_running;
   st_thread_id tick_thread_id;
+  atomic_uintnat tick_thread_stop;
 };
 
-/* thread_table instance, up to Max_domains */
-static struct caml_thread_table thread_table[Max_domains];
+/* thread_table instance, up to caml_params->max_domains */
+static struct caml_thread_table* thread_table;
 
 #define Thread_lock(dom_id) &thread_table[dom_id].thread_lock
 
@@ -131,6 +191,9 @@ static void thread_lock_release(int dom_id)
 {
   st_masterlock_release(Thread_lock(dom_id));
 }
+
+/* Used to signal that the "tick" thread for this domain should be stopped. */
+#define Tick_thread_stop thread_table[Caml_state->id].tick_thread_stop
 
 /* The remaining fields are accessed while holding the domain lock */
 
@@ -162,9 +225,8 @@ static void caml_thread_scan_roots(
   scanning_action action, scanning_action_flags fflags, void *fdata,
   caml_domain_state *domain_state)
 {
-  caml_thread_t active, th;
-
-  active = th = thread_table[domain_state->id].active_thread;
+  const caml_thread_t active = thread_table[domain_state->id].active_thread;
+  caml_thread_t th = active;
 
   /* The GC could be triggered before [active_thread] is initialized,
      or after [caml_thread_domain_stop_hook] has been called; in this
@@ -224,7 +286,8 @@ static void restore_runtime_state(caml_thread_t th)
   Caml_state->local_roots = th->local_roots;
   Caml_state->backtrace_pos = th->backtrace_pos;
   Caml_state->backtrace_buffer = th->backtrace_buffer;
-  Caml_state->backtrace_last_exn = th->backtrace_last_exn;
+  caml_modify_generational_global_root
+    (&Caml_state->backtrace_last_exn, th->backtrace_last_exn);
 #ifndef NATIVE_CODE
   Caml_state->trap_sp_off = th->trap_sp_off;
   Caml_state->trap_barrier_off = th->trap_barrier_off;
@@ -413,7 +476,6 @@ static void caml_thread_reinitialize(void)
      are hopeless.)
   */
 
-  struct channel * chan;
   caml_thread_t th, next;
 
   th = Active_thread->next;
@@ -432,7 +494,7 @@ static void caml_thread_reinitialize(void)
      the effective owner of the lock. So there is no need to run
      st_masterlock_acquire (busy = 1) */
   st_masterlock *m = Thread_lock(Caml_state->id);
-  m->init = 0; /* force reinitialization */
+  m->init = false; /* force reinitialization */
   /* Note: initializing an already-initialized mutex and cond variable
      is UB (especially mutexes that are locked). This is best
      effort. */
@@ -442,10 +504,10 @@ static void caml_thread_reinitialize(void)
   /* Reinitialize IO mutexes, in case the fork happened while another thread
      had locked the channel. If so, we're likely in an inconsistent state,
      but we may be able to proceed anyway. */
-  for (chan = caml_all_opened_channels;
+  for (struct channel *chan = caml_all_opened_channels;
        chan != NULL;
        chan = chan->next) {
-    caml_plat_mutex_init(&chan->mutex);
+    caml_plat_mutex_reinit(&chan->mutex);
   }
 }
 
@@ -483,14 +545,12 @@ static void caml_thread_domain_stop_hook(void) {
    yet. */
 static void caml_thread_domain_initialize_hook(void)
 {
-
   caml_thread_t new_thread;
 
-  /* OS-specific initialization */
-  st_initialize();
+  atomic_store_release(&Tick_thread_stop, 0);
 
   int ret = st_masterlock_init(Thread_lock(Caml_state->id));
-  sync_check_error(ret, "caml_thread_domain_initialize_hook");
+  caml_check_error(ret, "caml_thread_domain_initialize_hook");
 
   new_thread =
     (caml_thread_t) caml_stat_alloc(sizeof(struct caml_thread_struct));
@@ -501,6 +561,7 @@ static void caml_thread_domain_initialize_hook(void)
   new_thread->prev = new_thread;
   new_thread->backtrace_last_exn = Val_unit;
   new_thread->memprof = caml_memprof_main_thread(Caml_state);
+  new_thread->signal_stack = NULL;
 
   st_tls_set(caml_thread_key, new_thread);
 
@@ -508,7 +569,7 @@ static void caml_thread_domain_initialize_hook(void)
   caml_memprof_enter_thread(new_thread->memprof);
 }
 
-CAMLprim value caml_thread_yield(value unit);
+static void thread_yield(void);
 
 void caml_thread_interrupt_hook(void)
 {
@@ -520,7 +581,7 @@ void caml_thread_interrupt_hook(void)
     &Caml_state->requested_external_interrupt;
 
   if (atomic_compare_exchange_strong(req_external_interrupt, &is_on, 0)) {
-    caml_thread_yield(Val_unit);
+    thread_yield();
   }
 
   return;
@@ -540,6 +601,12 @@ CAMLprim value caml_thread_initialize(value unit)
   if (!caml_domain_alone())
     caml_failwith("caml_thread_initialize: cannot initialize Thread "
                   "while several domains are running.");
+
+  thread_table = caml_stat_calloc_noexc(caml_params->max_domains,
+                                        sizeof(struct caml_thread_table));
+  if (thread_table == NULL)
+    caml_fatal_error("caml_thread_initialize: failed to allocate thread"
+                     " table");
 
   /* Initialize the key to the [caml_thread_t] structure */
   st_tls_newkey(&caml_thread_key);
@@ -635,6 +702,33 @@ static void * caml_thread_start(void * v)
   return 0;
 }
 
+struct caml_thread_tick_args {
+  int domain_id;
+  atomic_uintnat* stop;
+};
+
+/* The tick thread: interrupt the domain periodically to force preemption  */
+static void * caml_thread_tick(void * arg)
+{
+  struct caml_thread_tick_args* tick_thread_args =
+    (struct caml_thread_tick_args*) arg;
+  int domain_id = tick_thread_args->domain_id;
+  atomic_uintnat* stop = tick_thread_args->stop;
+  st_timeout t = st_timeout_of_msec(Thread_timeout_msec);
+  caml_stat_free(tick_thread_args);
+
+  caml_init_domain_self(domain_id);
+  caml_domain_state *domain = Caml_state;
+
+  while(! atomic_load_acquire(stop)) {
+    st_msleep(&t);
+
+    atomic_store_release(&domain->requested_external_interrupt, 1);
+    caml_interrupt_self();
+  }
+  return NULL;
+}
+
 static st_retcode create_tick_thread(void)
 {
   if (Tick_thread_running) return 0;
@@ -648,14 +742,25 @@ static st_retcode create_tick_thread(void)
   pthread_sigmask(SIG_BLOCK, &mask, &old_mask);
 #endif
 
+  struct caml_thread_tick_args* tick_thread_args =
+    caml_stat_alloc_noexc(sizeof(struct caml_thread_tick_args));
+  if (tick_thread_args == NULL)
+    caml_fatal_error("create_tick_thread: failed to allocate thread args");
+
+  tick_thread_args->domain_id = Caml_state->id;
+  tick_thread_args->stop = &Tick_thread_stop;
+
   st_retcode err = st_thread_create(&Tick_thread_id, caml_thread_tick,
-                         (void *) &Caml_state->id);
+                                    (void *)tick_thread_args);
 
 #ifdef POSIX_SIGNALS
   pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
 #endif
 
-  if (err != 0) return err;
+  if (err != 0) {
+    caml_stat_free(tick_thread_args);
+    return err;
+  }
 
   Tick_thread_running = 1;
   return 0;
@@ -674,7 +779,7 @@ CAMLprim value caml_thread_new(value clos)
      Because of PR#4666, we start the tick thread late, only when we create
      the first additional thread in the current process */
   st_retcode err = create_tick_thread();
-  sync_check_error(err, "Thread.create");
+  caml_check_error(err, "Thread.create");
 
   /* Create a thread info block */
   caml_thread_t th = thread_alloc_and_add();
@@ -686,7 +791,7 @@ CAMLprim value caml_thread_new(value clos)
   if (err != 0) {
     /* Creation failed, remove thread info block from list of threads */
     caml_thread_remove_and_free(th);
-    sync_check_error(err, "Thread.create");
+    caml_check_error(err, "Thread.create");
   }
 
   CAMLreturn(th->descr);
@@ -779,26 +884,33 @@ CAMLprim value caml_thread_uncaught_exception(value exn)
 
 /* Allow re-scheduling */
 
-CAMLprim value caml_thread_yield(value unit)
+static void thread_yield(void)
 {
   st_masterlock *m = Thread_lock(Caml_state->id);
   if (st_masterlock_waiters(m) == 0)
-    return Val_unit;
+    return;
 
   /* Do all the parts of a blocking section enter&leave except lock
      manipulation, which we will do more efficiently in
-     st_thread_yield, and asynchronous actions (since
-     [caml_thread_yield] must not raise). (Since our blocking section
-     does not contain anything interesting, do not bother saving
-     errno.)
+     st_thread_yield, and executing signal handlers (which is already
+     done at this point as part of the asynchronous actions mechanism
+     when forcing a systhread yield). (Since our blocking section does
+     not contain anything interesting, do not bother saving errno.)
   */
 
   save_runtime_state();
   st_thread_yield(m);
   restore_runtime_state(This_thread);
+
+  /* Switching threads might have unmasked some signal. */
   if (caml_check_pending_signals())
     caml_set_action_pending(Caml_state);
+}
 
+CAMLprim value caml_thread_yield(value unit)
+{
+  caml_process_pending_actions();
+  thread_yield();
   return Val_unit;
 }
 
@@ -807,7 +919,7 @@ CAMLprim value caml_thread_yield(value unit)
 CAMLprim value caml_thread_join(value th)
 {
   st_retcode rc = caml_threadstatus_wait(Terminated(th));
-  sync_check_error(rc, "Thread.join");
+  caml_check_error(rc, "Thread.join");
   return Val_unit;
 }
 
@@ -842,7 +954,7 @@ static value caml_threadstatus_new (void)
 {
   st_event ts = NULL;           /* suppress warning */
   value wrapper;
-  sync_check_error(st_event_create(&ts), "Thread.create");
+  caml_check_error(st_event_create(&ts), "Thread.create");
   wrapper = caml_alloc_custom(&caml_threadstatus_ops,
                               sizeof(st_event *),
                               0, 1);
@@ -866,4 +978,43 @@ static st_retcode caml_threadstatus_wait (value wrapper)
   caml_leave_blocking_section();
 
   CAMLreturnT(st_retcode, retcode);
+}
+
+/* Set the current thread's name. */
+CAMLprim value caml_set_current_thread_name(value name)
+{
+#if defined(_WIN32)
+
+#  if defined(HAS_SETTHREADDESCRIPTION)
+  wchar_t *thread_name = caml_stat_strdup_to_utf16(String_val(name));
+  SetThreadDescription(GetCurrentThread(), thread_name);
+  caml_stat_free(thread_name);
+#  endif
+
+#  if defined(HAS_PTHREAD_SETNAME_NP)
+  // We are using both methods.
+  // See: https://github.com/ocaml/ocaml/pull/13504#discussion_r1786358928
+  pthread_setname_np(pthread_self(), String_val(name));
+#  endif
+
+#elif defined(HAS_PRCTL)
+  prctl(PR_SET_NAME, String_val(name));
+#elif defined(HAS_PTHREAD_SETNAME_NP)
+#  if defined(__APPLE__)
+  pthread_setname_np(String_val(name));
+#  elif defined(__NetBSD__)
+  pthread_setname_np(pthread_self(), "%s", String_val(name));
+#  else
+  pthread_setname_np(pthread_self(), String_val(name));
+#  endif
+#elif defined(HAS_PTHREAD_SET_NAME_NP)
+  pthread_set_name_np(pthread_self(), String_val(name));
+#else
+  if (caml_runtime_warnings_active()) {
+    fprintf(stderr, "set thread name not implemented\n");
+    fflush(stderr);
+  }
+#endif
+
+  return Val_unit;
 }

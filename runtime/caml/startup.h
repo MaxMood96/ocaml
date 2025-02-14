@@ -41,11 +41,12 @@ enum { FILE_NOT_FOUND = -1, BAD_BYTECODE = -2, WRONG_MAGIC = -3, NO_FDS = -4 };
 
 extern int caml_attempt_open(char_os **name, struct exec_trailer *trail,
                              int do_open_script);
+extern int caml_read_trailer(int fd, struct exec_trailer *trail);
 extern void caml_read_section_descriptors(int fd, struct exec_trailer *trail);
 extern int32_t caml_seek_optional_section(int fd, struct exec_trailer *trail,
-                                        char *name);
+                                          const char *name);
 extern int32_t caml_seek_section(int fd, struct exec_trailer *trail,
-                                 char *name);
+                                 const char *name);
 
 enum caml_byte_program_mode
   {

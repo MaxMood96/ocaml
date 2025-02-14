@@ -37,9 +37,6 @@
 #include "caml/reverse.h"
 #include "caml/shared_heap.h"
 #include "caml/signals.h"
-#ifdef HAS_ZSTD
-#include <zstd.h>
-#endif
 
 /* Item on the stack with defined operation */
 struct intern_item {
@@ -233,7 +230,8 @@ static void intern_init(struct caml_intern_state* s, const void * src,
   /* This is asserted at the beginning of demarshaling primitives.
      If it fails, it probably means that an exception was raised
      without calling intern_cleanup() during the previous demarshaling. */
-  CAMLassert (s->intern_input == NULL && s->intern_obj_table == NULL);
+  CAMLassert(s->intern_input == NULL);
+  CAMLassert(s->intern_obj_table == NULL);
   s->intern_src = src;
   s->intern_input = input;
 }
@@ -306,7 +304,6 @@ static void readfloat(struct caml_intern_state* s,
 static void readfloats(struct caml_intern_state* s,
                        double * dest, mlsize_t len, unsigned int code)
 {
-  mlsize_t i;
   if (sizeof(double) != 8) {
     intern_cleanup(s);
     caml_invalid_argument("input_value: non-standard floats");
@@ -317,22 +314,22 @@ static void readfloats(struct caml_intern_state* s,
   /* Host is big-endian; fix up if data read is little-endian */
   if (code != CODE_DOUBLE_ARRAY8_BIG &&
       code != CODE_DOUBLE_ARRAY32_BIG) {
-    for (i = 0; i < len; i++) Reverse_64(dest + i, dest + i);
+    for (mlsize_t i = 0; i < len; i++) Reverse_64(dest + i, dest + i);
   }
 #elif ARCH_FLOAT_ENDIANNESS == 0x01234567
   /* Host is little-endian; fix up if data read is big-endian */
   if (code != CODE_DOUBLE_ARRAY8_LITTLE &&
       code != CODE_DOUBLE_ARRAY32_LITTLE) {
-    for (i = 0; i < len; i++) Reverse_64(dest + i, dest + i);
+    for (mlsize_t i = 0; i < len; i++) Reverse_64(dest + i, dest + i);
   }
 #else
   /* Host is neither big nor little; permute as appropriate */
   if (code == CODE_DOUBLE_ARRAY8_LITTLE ||
       code == CODE_DOUBLE_ARRAY32_LITTLE) {
-    for (i = 0; i < len; i++)
+    for (mlsize_t i = 0; i < len; i++)
       Permute_64(dest + i, ARCH_FLOAT_ENDIANNESS, dest + i, 0x01234567);
   } else {
-    for (i = 0; i < len; i++)
+    for (mlsize_t i = 0; i < len; i++)
       Permute_64(dest + i, ARCH_FLOAT_ENDIANNESS, dest + i, 0x76543210);
   }
 #endif
@@ -340,13 +337,13 @@ static void readfloats(struct caml_intern_state* s,
 
 CAMLnoret static void intern_stack_overflow(struct caml_intern_state* s)
 {
-  caml_gc_message (0x04, "Stack overflow in un-marshaling value\n");
+  CAML_GC_MESSAGE(HEAPSIZE, "Stack overflow in un-marshaling value\n");
   intern_cleanup(s);
   caml_raise_out_of_memory();
 }
 
 static struct intern_item * intern_resize_stack(struct caml_intern_state* s,
-                                                struct intern_item * sp)
+                                                const struct intern_item * sp)
 {
   asize_t newsize = 2 * (s->intern_stack_limit - s->intern_stack);
   asize_t sp_offset = sp - s->intern_stack;
@@ -399,7 +396,9 @@ static void intern_alloc_storage(struct caml_intern_state* s, mlsize_t whsize,
   wosize = Wosize_whsize(whsize);
 
   if (wosize <= Max_young_wosize && wosize != 0) {
-    v = caml_alloc_small (wosize, String_tag);
+    /* don't track bulk allocation in minor heap with statmemprof;
+     * individual block allocations are tracked instead */
+    Alloc_small(v, wosize, String_tag, Alloc_small_enter_GC_no_track);
     s->intern_dest = (header_t *) Hp_val(v);
   } else {
     CAMLassert (s->intern_dest == NULL);
@@ -429,16 +428,22 @@ static value intern_alloc_obj(struct caml_intern_state* s, caml_domain_state* d,
                 (value*)s->intern_dest < d->young_end);
     p = s->intern_dest;
     *s->intern_dest = Make_header (wosize, tag, 0);
+    caml_memprof_sample_block(Val_hp(p), wosize, 1 + wosize,
+                              CAML_MEMPROF_SRC_MARSHAL);
     s->intern_dest += 1 + wosize;
   } else {
     p = caml_shared_try_alloc(d->shared_heap, wosize, tag,
                               0 /* no reserved bits */);
-    d->allocated_words += Whsize_wosize(wosize);
     if (p == NULL) {
       intern_cleanup (s);
       caml_raise_out_of_memory();
     }
+    d->allocated_words += Whsize_wosize(wosize);
+    d->allocated_words_direct += Whsize_wosize(wosize);
     Hd_hp(p) = Make_header (wosize, tag, caml_global_heap_state.MARKED);
+    caml_memprof_sample_block(Val_hp(p), wosize,
+                              Whsize_wosize(wosize),
+                              CAML_MEMPROF_SRC_MARSHAL);
   }
   return Val_hp(p);
 }
@@ -721,8 +726,6 @@ static void intern_rec(struct caml_intern_state* s,
      may crash. */
   *dest = v;
   break;
-  default:
-    CAMLassert(0);
   }
   }
   /* We are done. Cleanup the stack and leave the function */
@@ -815,32 +818,40 @@ static void caml_parse_header(struct caml_intern_state* s,
    when the memory block for the compressed input can be freed
    before more memory is allocated. */
 
+size_t (*caml_intern_decompress_input)(unsigned char *,
+                                       uintnat,
+                                       const unsigned char *,
+                                       uintnat) = NULL;
+
 static void intern_decompress_input(struct caml_intern_state * s,
                                     const char * fun_name,
                                     struct marshal_header * h)
 {
   s->compressed = h->compressed;
   if (! h->compressed) return;
-#ifdef HAS_ZSTD
-  unsigned char * blk = malloc(h->uncompressed_data_len);
-  if (blk == NULL) {
+  if (caml_intern_decompress_input != NULL) {
+    unsigned char * blk = malloc(h->uncompressed_data_len);
+    if (blk == NULL) {
+      intern_cleanup(s);
+      caml_raise_out_of_memory();
+    }
+    size_t res =
+      caml_intern_decompress_input(blk,
+                                   h->uncompressed_data_len,
+                                   s->intern_src,
+                                   h->data_len);
+    if (res != h->uncompressed_data_len) {
+      free(blk);
+      intern_cleanup(s);
+      intern_failwith2(fun_name, "decompression error");
+    }
+    if (s->intern_input != NULL) free(s->intern_input);
+    s->intern_input = blk;  /* to be freed at end of demarshaling */
+    s->intern_src = blk;
+  } else {
     intern_cleanup(s);
-    caml_raise_out_of_memory();
+    intern_failwith2(fun_name, "compressed object, cannot decompress");
   }
-  size_t res =
-    ZSTD_decompress(blk, h->uncompressed_data_len, s->intern_src, h->data_len);
-  if (res != h->uncompressed_data_len) {
-    free(blk);
-    intern_cleanup(s);
-    intern_failwith2(fun_name, "decompression error");
-  }
-  if (s->intern_input != NULL) free(s->intern_input);
-  s->intern_input = blk;  /* to be freed at end of demarshaling */
-  s->intern_src = blk;
-#else
-  intern_cleanup(s);
-  intern_failwith2(fun_name, "compressed object, cannot decompress");
-#endif
 }
 
 /* Reading from a channel */
@@ -1041,7 +1052,7 @@ CAMLprim value caml_marshal_data_size(value buff, value ofs)
 static char * intern_resolve_code_pointer(unsigned char digest[16],
                                           asize_t offset)
 {
-  struct code_fragment * cf = caml_find_code_fragment_by_digest(digest);
+  const struct code_fragment * cf = caml_find_code_fragment_by_digest(digest);
   if (cf != NULL && cf->code_start + offset < cf->code_end)
     return cf->code_start + offset;
   else
@@ -1196,7 +1207,7 @@ CAMLexport void caml_deserialize_block_float_8(void * data, intnat len)
 #endif
 }
 
-CAMLexport void caml_deserialize_error(char * msg)
+CAMLexport void caml_deserialize_error(const char * msg)
 {
   struct caml_intern_state* s = get_intern_state ();
   intern_cleanup(s);

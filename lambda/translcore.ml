@@ -20,6 +20,7 @@ open Misc
 open Asttypes
 open Primitive
 open Types
+open Data_types
 open Typedtree
 open Typeopt
 open Lambda
@@ -31,7 +32,7 @@ type error =
 
 exception Error of Location.t * error
 
-let use_dup_for_constant_arrays_bigger_than = 4
+let use_dup_for_constant_mutable_arrays_bigger_than = 4
 
 (* Forward declaration -- to be filled in by Translmod.transl_module *)
 let transl_module =
@@ -51,7 +52,7 @@ let prim_fresh_oo_id =
 let transl_extension_constructor ~scopes env path ext =
   let path =
     Printtyp.wrap_printing_env env ~error:true (fun () ->
-      Option.map (Printtyp.rewrite_double_underscore_paths env) path)
+      Option.map (Out_type.rewrite_double_underscore_paths env) path)
   in
   let name =
     match path, !Clflags.for_package with
@@ -157,8 +158,8 @@ let fuse_method_arity parent_params parent_body =
 
 let rec iter_exn_names f pat =
   match pat.pat_desc with
-  | Tpat_var (id, _) -> f id
-  | Tpat_alias (p, id, _) ->
+  | Tpat_var (id, _, _) -> f id
+  | Tpat_alias (p, id, _, _, _) ->
       f id;
       iter_exn_names f p
   | _ -> ()
@@ -172,6 +173,10 @@ let transl_ident loc env ty path desc =
   | Val_reg | Val_self _ ->
       transl_value_path loc env path
   |  _ -> fatal_error "Translcore.transl_exp: bad Texp_ident"
+
+let is_omitted = function
+  | Arg _ -> false
+  | Omitted () -> true
 
 let rec transl_exp ~scopes e =
   transl_exp1 ~scopes ~in_new_scope:false e
@@ -212,10 +217,10 @@ and transl_exp0 ~in_new_scope ~scopes e =
   | Texp_apply({ exp_desc = Texp_ident(path, _, {val_kind = Val_prim p});
                 exp_type = prim_type } as funct, oargs)
     when List.length oargs >= p.prim_arity
-    && List.for_all (fun (_, arg) -> arg <> None) oargs ->
+    && List.for_all (fun (_, arg) -> not (is_omitted arg)) oargs ->
       let argl, extra_args = cut p.prim_arity oargs in
       let arg_exps =
-         List.map (function _, Some x -> x | _ -> assert false) argl
+         List.map (function _, Arg x -> x | _, Omitted () -> assert false) argl
       in
       let args = transl_list ~scopes arg_exps in
       let prim_exp = if extra_args = [] then Some e else None in
@@ -242,15 +247,39 @@ and transl_exp0 ~in_new_scope ~scopes e =
       event_after ~scopes e
         (transl_apply ~scopes ~tailcall ~inlined ~specialised
            (transl_exp ~scopes funct) oargs (of_location ~scopes e.exp_loc))
-  | Texp_match(arg, pat_expr_list, partial) ->
+  | Texp_match(arg, pat_expr_list, [], partial) ->
       transl_match ~scopes e arg pat_expr_list partial
-  | Texp_try(body, pat_expr_list) ->
+  | Texp_match(arg, pat_expr_list, eff_pat_expr_list, partial) ->
+  (* need to separate the values from exceptions for transl_handler *)
+      let split_case (val_cases, exn_cases as acc)
+            ({ c_lhs; c_rhs } as case) =
+        if c_rhs.exp_desc = Texp_unreachable then acc else
+        let val_pat, exn_pat = split_pattern c_lhs in
+        match val_pat, exn_pat with
+        | None, None -> assert false
+        | Some pv, None ->
+            { case with c_lhs = pv } :: val_cases, exn_cases
+        | None, Some pe ->
+            val_cases, { case with c_lhs = pe } :: exn_cases
+        | Some pv, Some pe ->
+            { case with c_lhs = pv } :: val_cases,
+            { case with c_lhs = pe } :: exn_cases
+      in
+      let pat_expr_list, exn_pat_expr_list =
+        let x, y = List.fold_left split_case ([], []) pat_expr_list in
+        List.rev x, List.rev y
+      in
+      transl_handler ~scopes e arg (Some (pat_expr_list, partial))
+        exn_pat_expr_list eff_pat_expr_list
+  | Texp_try(body, pat_expr_list, []) ->
       let id = Typecore.name_cases "exn" pat_expr_list in
       Ltrywith(transl_exp ~scopes body, id,
                Matching.for_trywith ~scopes e.exp_loc (Lvar id)
                  (transl_cases_try ~scopes pat_expr_list))
+  | Texp_try(body, exn_pat_expr_list, eff_pat_expr_list) ->
+      transl_handler ~scopes e body None exn_pat_expr_list eff_pat_expr_list
   | Texp_tuple el ->
-      let ll, shape = transl_list_with_shape ~scopes el in
+      let ll, shape = transl_list_with_shape ~scopes (List.map snd el) in
       begin try
         Lconst(Const_block(0, List.map extract_constant ll))
       with Not_constant ->
@@ -328,40 +357,45 @@ and transl_exp0 ~in_new_scope ~scopes e =
       in
       Lprim(access, [transl_exp ~scopes arg; transl_exp ~scopes newval],
             of_location ~scopes e.exp_loc)
-  | Texp_array expr_list ->
+  | Texp_array (amut, expr_list) ->
       let kind = array_kind e in
       let ll = transl_list ~scopes expr_list in
+      let loc = of_location ~scopes e.exp_loc in
+      let makearray mutability =
+        Lprim (Pmakearray (kind, mutability), ll, loc)
+      in
+      let duparray_to_mutable array =
+        Lprim (Pduparray (kind, Mutable), [array], loc)
+      in
+      let imm_array = makearray Immutable in
       begin try
         (* For native code the decision as to which compilation strategy to
            use is made later.  This enables the Flambda passes to lift certain
            kinds of array definitions to symbols. *)
         (* Deactivate constant optimization if array is small enough *)
-        if List.length ll <= use_dup_for_constant_arrays_bigger_than
+        if amut = Asttypes.Mutable &&
+           List.length ll <= use_dup_for_constant_mutable_arrays_bigger_than
         then begin
           raise Not_constant
         end;
         begin match List.map extract_constant ll with
-        | exception Not_constant when kind = Pfloatarray ->
-            (* We cannot currently lift [Pintarray] arrays safely in Flambda
-               because [caml_modify] might be called upon them (e.g. from
-               code operating on polymorphic arrays, or functions such as
-               [caml_array_blit].
-               To avoid having different Lambda code for
-               bytecode/Closure vs.  Flambda, we always generate
-               [Pduparray] here, and deal with it in [Bytegen] (or in
-               the case of Closure, in [Cmmgen], which already has to
-               handle [Pduparray Pmakearray Pfloatarray] in the case
-               where the array turned out to be inconstant).
+        | exception Not_constant
+          when kind = Pfloatarray && amut = Asttypes.Mutable ->
+            (* We cannot currently lift mutable [Pintarray] arrays safely in
+               Flambda because [caml_modify] might be called upon them
+               (e.g. from code operating on polymorphic arrays, or functions
+               such as [caml_array_blit].
+               To avoid having different Lambda code for bytecode/Closure
+               vs. Flambda, we always generate [Pduparray] for mutable arrays
+               here, and deal with it in [Bytegen] (or in the case of Closure,
+               in [Cmmgen], which already has to handle [Pduparray Pmakearray
+               Pfloatarray] in the case where the array turned out to be
+               inconstant).
                When not [Pfloatarray], the exception propagates to the handler
                below. *)
-            let imm_array =
-              Lprim (Pmakearray (kind, Immutable), ll,
-                     of_location ~scopes e.exp_loc)
-            in
-            Lprim (Pduparray (kind, Mutable), [imm_array],
-                   of_location ~scopes e.exp_loc)
+            duparray_to_mutable imm_array
         | cl ->
-            let imm_array =
+            let const =
               match kind with
               | Paddrarray | Pintarray ->
                   Lconst(Const_block(0, cl))
@@ -370,12 +404,12 @@ and transl_exp0 ~in_new_scope ~scopes e =
               | Pgenarray ->
                   raise Not_constant    (* can this really happen? *)
             in
-            Lprim (Pduparray (kind, Mutable), [imm_array],
-                   of_location ~scopes e.exp_loc)
+            match amut with
+            | Mutable   -> duparray_to_mutable const
+            | Immutable -> const
         end
       with Not_constant ->
-        Lprim(Pmakearray (kind, Mutable), ll,
-              of_location ~scopes e.exp_loc)
+        makearray amut
       end
   | Texp_ifthenelse(cond, ifso, Some ifnot) ->
       Lifthenelse(transl_exp ~scopes cond,
@@ -588,13 +622,20 @@ and transl_guard ~scopes guard rhs =
       event_before ~scopes cond
         (Lifthenelse(transl_exp ~scopes cond, expr, staticfail))
 
-and transl_case ~scopes {c_lhs; c_guard; c_rhs} =
-  (c_lhs, transl_guard ~scopes c_guard c_rhs)
+and transl_cont cont c_cont body =
+  match cont, c_cont with
+  | Some id1, Some id2 -> Llet(Alias, Pgenval, id2, Lvar id1, body)
+  | None, None
+  | Some _, None -> body
+  | None, Some _ -> assert false
 
-and transl_cases ~scopes cases =
+and transl_case ~scopes ?cont {c_lhs; c_cont; c_guard; c_rhs} =
+  (c_lhs, transl_cont cont c_cont (transl_guard ~scopes c_guard c_rhs))
+
+and transl_cases ~scopes ?cont cases =
   let cases =
     List.filter (fun c -> c.c_rhs.exp_desc <> Texp_unreachable) cases in
-  List.map (transl_case ~scopes) cases
+  List.map (transl_case ~scopes ?cont) cases
 
 and transl_case_try ~scopes {c_lhs; c_guard; c_rhs} =
   iter_exn_names Translprim.add_exception_ident c_lhs;
@@ -652,7 +693,7 @@ and transl_apply ~scopes
        non-optional parameter that follows it have been received.
   *)
   let rec build_apply lam args = function
-      (None, optional) :: l ->
+      (Omitted (), optional) :: l ->
         (* Out-of-order partial application; we will need to build a closure *)
         let defs = ref [] in
         let protect name lam =
@@ -682,7 +723,9 @@ and transl_apply ~scopes
         (* Evaluate the remaining arguments;
            if we already passed here this is a no-op. *)
         let l =
-          List.map (fun (arg, opt) -> Option.map (protect "arg") arg, opt) l
+          List.map
+            (fun (arg, opt) -> Typedtree.map_apply_arg (protect "arg") arg, opt)
+            l
         in
         let id_arg = Ident.create_local "param" in
         (* Process remaining arguments and build closure *)
@@ -702,13 +745,14 @@ and transl_apply ~scopes
         List.fold_right
           (fun (id, lam) body -> Llet(Strict, Pgenval, id, lam, body))
           !defs body
-    | (Some arg, optional) :: l ->
+    | (Arg arg, optional) :: l ->
         build_apply lam ((arg, optional) :: args) l
     | [] ->
         lapply lam (List.rev_map fst args)
   in
-  (build_apply lam [] (List.map (fun (l, x) ->
-                                   Option.map (transl_exp ~scopes) x,
+  let transl_arg arg = Typedtree.map_apply_arg (transl_exp ~scopes) arg in
+  (build_apply lam [] (List.map (fun (l, arg) ->
+                                   transl_arg arg,
                                    Btype.is_optional l)
                                 sargs)
      : Lambda.lambda)
@@ -742,7 +786,9 @@ and transl_tupled_function ~scopes loc return repr params body =
     | [], Tfunction_cases { cases; partial } ->
         Some (cases, partial)
     | [ { fp_kind = Tparam_pat pat; fp_partial } ], Tfunction_body body ->
-        let case = { c_lhs = pat; c_guard = None; c_rhs = body } in
+        let case =
+          { c_lhs = pat; c_cont = None; c_guard = None; c_rhs = body }
+        in
         Some ([ case ], fp_partial)
     | _ -> None
   in
@@ -927,8 +973,8 @@ and transl_let ~scopes ?(in_structure=false) rec_flag pat_expr_list =
       let idlist =
         List.map
           (fun {vb_pat=pat} -> match pat.pat_desc with
-              Tpat_var (id,_) -> id
-            | Tpat_alias ({pat_desc=Tpat_any}, id,_) -> id
+              Tpat_var (id,_,_) -> id
+            | Tpat_alias ({pat_desc=Tpat_any}, id,_,_,_) -> id
             | _ -> assert false)
         pat_expr_list in
       let transl_case {vb_expr=expr; vb_attributes; vb_rec_kind = rkind;
@@ -937,9 +983,9 @@ and transl_let ~scopes ?(in_structure=false) rec_flag pat_expr_list =
         let def =
           Translattribute.add_function_attributes def vb_loc vb_attributes
         in
-        { id; rkind; def } in
+        ( id, rkind, def ) in
       let lam_bds = List.map2 transl_case pat_expr_list idlist in
-      fun body -> Lletrec(lam_bds, body)
+      fun body -> Value_rec_compiler.compile_letrec lam_bds body
 
 and transl_setinstvar ~scopes loc self var expr =
   Lprim(Psetfield_computed (maybe_pointer expr, Assignment),
@@ -1069,9 +1115,9 @@ and transl_match ~scopes e arg pat_expr_list partial =
         (* Simplif doesn't like it if binders are not uniq, so we make sure to
            use different names in the value and the exception branches. *)
         let ids_full = Typedtree.pat_bound_idents_full pv in
-        let ids = List.map (fun (id, _, _) -> id) ids_full in
+        let ids = List.map (fun (id, _, _, _) -> id) ids_full in
         let ids_kinds =
-          List.map (fun (id, _, ty) -> id, Typeopt.value_kind pv.pat_env ty)
+          List.map (fun (id, _, ty, _) -> id, Typeopt.value_kind pv.pat_env ty)
             ids_full
         in
         let vids = List.map Ident.rename ids in
@@ -1124,8 +1170,9 @@ and transl_match ~scopes e arg pat_expr_list partial =
     | {exp_desc = Texp_tuple argl}, [] ->
       assert (static_handlers = []);
       Matching.for_multiple_match ~scopes e.exp_loc
-        (transl_list ~scopes argl) val_cases partial
+        (transl_list ~scopes (List.map snd argl)) val_cases partial
     | {exp_desc = Texp_tuple argl}, _ :: _ ->
+        let argl = List.map snd argl in
         let val_ids =
           List.map
             (fun arg ->
@@ -1152,6 +1199,65 @@ and transl_match ~scopes e arg pat_expr_list partial =
   List.fold_left (fun body (static_exception_id, val_ids, handler) ->
     Lstaticcatch (body, (static_exception_id, val_ids), handler)
   ) classic static_handlers
+
+and prim_alloc_stack =
+  Pccall (Primitive.simple ~name:"caml_alloc_stack" ~arity:3 ~alloc:true)
+
+and transl_handler ~scopes e body val_caselist exn_caselist eff_caselist =
+  let val_fun =
+    match val_caselist with
+    | None ->
+        let param = Ident.create_local "param" in
+        lfunction ~kind:Curried ~params:[param, Pgenval]
+         ~return:Pgenval ~body:(Lvar param)
+         ~attr:default_function_attribute ~loc:Loc_unknown
+    | Some (val_caselist, partial) ->
+        let val_cases = transl_cases ~scopes val_caselist in
+        let param = Typecore.name_cases "param" val_caselist in
+        let body =
+          Matching.for_function ~scopes e.exp_loc None (Lvar param) val_cases
+            partial
+        in
+        lfunction ~kind:Curried ~params:[param, Pgenval]
+          ~return:Pgenval ~attr:default_function_attribute
+          ~loc:Loc_unknown ~body
+  in
+  let exn_fun =
+    let exn_cases = transl_cases ~scopes exn_caselist in
+    let param = Typecore.name_cases "exn" exn_caselist in
+    let body = Matching.for_trywith ~scopes e.exp_loc (Lvar param) exn_cases in
+    lfunction ~kind:Curried ~params:[param, Pgenval] ~return:Pgenval
+      ~attr:default_function_attribute ~loc:Loc_unknown ~body
+  in
+  let eff_fun =
+    let param = Typecore.name_cases "eff" eff_caselist in
+    let cont = Ident.create_local "k" in
+    let cont_tail = Ident.create_local "ktail" in
+    let eff_cases = transl_cases ~scopes ~cont eff_caselist in
+    let body =
+      Matching.for_handler ~scopes e.exp_loc (Lvar param) (Lvar cont)
+        (Lvar cont_tail) eff_cases
+    in
+    lfunction ~kind:Curried
+      ~params:[(param, Pgenval); (cont, Pgenval); (cont_tail, Pgenval)]
+      ~return:Pgenval ~attr:default_function_attribute ~loc:Loc_unknown ~body
+  in
+  let (body_fun, arg) =
+    match transl_exp ~scopes body with
+    | Lapply { ap_func = fn; ap_args = [arg]; _ }
+        when is_evaluated fn && is_evaluated arg -> (fn, arg)
+    | body ->
+       let param = Ident.create_local "param" in
+       (lfunction ~kind:Curried ~params:[param, Pgenval] ~return:Pgenval
+                  ~attr:default_function_attribute ~loc:Loc_unknown
+                  ~body,
+        Lconst(Const_base(Const_int 0)))
+  in
+  let alloc_stack =
+    Lprim(prim_alloc_stack, [val_fun; exn_fun; eff_fun], Loc_unknown)
+  in
+  Lprim(Prunstack, [alloc_stack; body_fun; arg],
+        of_location ~scopes e.exp_loc)
 
 and transl_letop ~scopes loc env let_ ands param case partial =
   let rec loop prev_lam = function
@@ -1221,9 +1327,9 @@ let transl_let rec_flag pat_expr_list body =
 
 (* Error report *)
 
-open Format
+open Format_doc
 
-let report_error ppf = function
+let report_error_doc ppf = function
   | Free_super_var ->
       fprintf ppf
         "Ancestor names can only be used to select inherited methods"
@@ -1234,7 +1340,9 @@ let () =
   Location.register_error_of_exn
     (function
       | Error (loc, err) ->
-          Some (Location.error_of_printer ~loc report_error err)
+          Some (Location.error_of_printer ~loc report_error_doc err)
       | _ ->
         None
     )
+
+let report_error = Format_doc.compat report_error_doc

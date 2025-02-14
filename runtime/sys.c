@@ -28,11 +28,12 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h> /* for _wchdir and _wgetcwd */
+#include <io.h> /* for _wopen and close */
 #else
 #include <sys/wait.h>
 #endif
 #include "caml/config.h"
-#ifdef HAS_UNISTD
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 #ifdef HAS_TIMES
@@ -45,8 +46,8 @@
 #ifdef HAS_GETTIMEOFDAY
 #include <sys/time.h>
 #endif
-#ifdef __APPLE__
-#include <sys/random.h> /* for getentropy */
+#if defined(HAS_GETENTROPY) && defined(__APPLE__)
+#include <sys/random.h>
 #endif
 #include "caml/alloc.h"
 #include "caml/debugger.h"
@@ -136,7 +137,7 @@ CAMLexport void caml_do_exit(int retcode)
   caml_domain_state* domain_state = Caml_state;
   struct gc_stats s;
 
-  if ((atomic_load_relaxed(&caml_verb_gc) & 0x400) != 0) {
+  if ((atomic_load_relaxed(&caml_verb_gc) & CAML_GC_MSG_STATS) != 0) {
     caml_compute_gc_stats(&s);
     {
       /* cf caml_gc_counters */
@@ -159,29 +160,33 @@ CAMLexport void caml_do_exit(int retcode)
         top_heap_words = caml_top_heap_words(Caml_state->shared_heap);
       }
 
-      caml_gc_message(0x400, "allocated_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
-                    (intnat)allocated_words);
-      caml_gc_message(0x400, "minor_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
-                    (intnat) minwords);
-      caml_gc_message(0x400, "promoted_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
-                      (intnat) s.alloc_stats.promoted_words);
-      caml_gc_message(0x400, "major_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
-                      (intnat) majwords);
-      caml_gc_message(0x400,
+      CAML_GC_MESSAGE(STATS,
+          "allocated_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
+          (intnat)allocated_words);
+      CAML_GC_MESSAGE(STATS,
+          "minor_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
+          (intnat) minwords);
+      CAML_GC_MESSAGE(STATS,
+          "promoted_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
+          (intnat) s.alloc_stats.promoted_words);
+      CAML_GC_MESSAGE(STATS,
+          "major_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
+          (intnat) majwords);
+      CAML_GC_MESSAGE(STATS,
           "minor_collections: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
           (intnat) atomic_load(&caml_minor_collections_count));
-      caml_gc_message(0x400,
+      CAML_GC_MESSAGE(STATS,
           "major_collections: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
           caml_major_cycles_completed);
-      caml_gc_message(0x400,
+      CAML_GC_MESSAGE(STATS,
           "forced_major_collections: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
           (intnat)s.alloc_stats.forced_major_collections);
-      caml_gc_message(0x400, "heap_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
-                    heap_words);
-      caml_gc_message(0x400, "top_heap_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
-                      top_heap_words);
-      caml_gc_message(0x400, "mean_space_overhead: %lf\n",
-                      caml_mean_space_overhead());
+      CAML_GC_MESSAGE(STATS,
+          "heap_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
+          heap_words);
+      CAML_GC_MESSAGE(STATS,
+          "top_heap_words: %"ARCH_INTNAT_PRINTF_FORMAT"d\n",
+          top_heap_words);
     }
   }
 
@@ -364,15 +369,16 @@ CAMLprim value caml_sys_chdir(value dirname)
   CAMLreturn(Val_unit);
 }
 
-CAMLprim value caml_sys_mkdir(value path, value perm)
+CAMLprim value caml_sys_mkdir(value path, value vperm)
 {
-  CAMLparam2(path, perm);
+  CAMLparam2(path, vperm);
   char_os * p;
   int ret;
+  int perm = Int_val(vperm);
   caml_sys_check_path(path);
   p = caml_stat_strdup_to_os(String_val(path));
   caml_enter_blocking_section();
-  ret = mkdir_os(p, Int_val(perm));
+  ret = mkdir_os(p, perm);
   caml_leave_blocking_section();
   caml_stat_free(p);
   if (ret == -1) caml_sys_error(path);
@@ -428,12 +434,15 @@ CAMLprim value caml_sys_unsafe_getenv(value var)
   return val;
 }
 
-CAMLprim value caml_sys_getenv(value var)
+/* Returns either a string or Val_none on error (i.e. the tag is used to encode
+   error conditions */
+static value sys_getenv(value var)
 {
   char_os * res, * p;
   value val;
 
-  if (! caml_string_is_c_safe(var)) caml_raise_not_found();
+  if (! caml_string_is_c_safe(var))
+    return Val_none;
   p = caml_stat_strdup_to_os(String_val(var));
 #ifdef _WIN32
   res = caml_win32_getenv(p);
@@ -441,12 +450,33 @@ CAMLprim value caml_sys_getenv(value var)
   res = caml_secure_getenv(p);
 #endif
   caml_stat_free(p);
-  if (res == 0) caml_raise_not_found();
+  if (res == 0)
+    return Val_none;
   val = caml_copy_string_of_os(res);
 #ifdef _WIN32
   caml_stat_free(res);
 #endif
   return val;
+}
+
+CAMLprim value caml_sys_getenv(value var)
+{
+  value res = sys_getenv(var);
+
+  if (Is_none(res))
+    caml_raise_not_found();
+
+  return res;
+}
+
+CAMLprim value caml_sys_getenv_opt(value var)
+{
+  value res = sys_getenv(var);
+
+  if (!Is_none(res))
+    res = caml_alloc_some(res);
+
+  return res;
 }
 
 static value main_argv;
@@ -478,7 +508,7 @@ CAMLprim value caml_sys_executable_name(value unit)
   return caml_copy_string_of_os(caml_params->exe_name);
 }
 
-void caml_sys_init(char_os * exe_name, char_os **argv)
+void caml_sys_init(const char_os * exe_name, char_os **argv)
 {
 #ifdef _WIN32
   /* Initialises the caml_win32_* globals on Windows with the version of
@@ -539,19 +569,19 @@ double caml_sys_time_include_children_unboxed(value include_children)
 {
 #ifdef HAS_GETRUSAGE
   struct rusage ru;
-  double acc = 0.;
+  double sec = 0.;
 
   getrusage (RUSAGE_SELF, &ru);
-  acc += ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6
-    + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+  sec += ru.ru_utime.tv_sec + (double) ru.ru_utime.tv_usec / USEC_PER_SEC
+      +  ru.ru_stime.tv_sec + (double) ru.ru_stime.tv_usec / USEC_PER_SEC;
 
   if (Bool_val(include_children)) {
     getrusage (RUSAGE_CHILDREN, &ru);
-    acc += ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6
-      + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+    sec += ru.ru_utime.tv_sec + (double) ru.ru_utime.tv_usec / USEC_PER_SEC
+        +  ru.ru_stime.tv_sec + (double) ru.ru_stime.tv_usec / USEC_PER_SEC;
   }
 
-  return acc;
+  return sec;
 #else
   #ifdef HAS_TIMES
     #ifndef CLK_TCK
@@ -602,7 +632,7 @@ int caml_unix_random_seed(intnat data[16])
   int nread = 0;
 
   /* Try kernel entropy first */
-#if defined(HAS_GETENTROPY) || defined(__APPLE__)
+#ifdef HAS_GETENTROPY
   if (getentropy(buffer, 12) != -1) {
     nread = 12;
   } else
@@ -629,7 +659,7 @@ int caml_unix_random_seed(intnat data[16])
 #else
     if (n < 16) data[n++] = time(NULL);
 #endif
-#ifdef HAS_UNISTD
+#ifndef _WIN32
     if (n < 16) data[n++] = getpid();
     if (n < 16) data[n++] = getppid();
 #endif
@@ -641,7 +671,7 @@ int caml_unix_random_seed(intnat data[16])
 CAMLprim value caml_sys_random_seed (value unit)
 {
   intnat data[16];
-  int n, i;
+  int n;
   value res;
 #ifdef _WIN32
   n = caml_win32_random_seed(data);
@@ -650,7 +680,7 @@ CAMLprim value caml_sys_random_seed (value unit)
 #endif
   /* Convert to an OCaml array of ints */
   res = caml_alloc_small(n, 0);
-  for (i = 0; i < n; i++) Field(res, i) = Val_long(data[i]);
+  for (int i = 0; i < n; i++) Field(res, i) = Val_long(data[i]);
   return res;
 }
 
@@ -679,6 +709,11 @@ CAMLprim value caml_sys_const_int_size(value unit)
 CAMLprim value caml_sys_const_max_wosize(value unit)
 {
   return Val_long(Max_wosize) ;
+}
+
+CAMLprim value caml_sys_io_buffer_size(value unit)
+{
+  return Val_long(IO_BUFFER_SIZE);
 }
 
 CAMLprim value caml_sys_const_ostype_unix(value unit)
@@ -768,5 +803,17 @@ CAMLprim value caml_xdg_defaults(value unit)
   return caml_win32_xdg_defaults();
 #else
   return Val_emptylist;
+#endif
+}
+
+/* On Windows, returns the path to a directory suitable for storing
+   temporary files. On Unix, this path is more easily computed in
+   OCaml, so the string returned by the primitive is empty. */
+CAMLprim value caml_sys_temp_dir_name(value unit)
+{
+#ifdef _WIN32
+  return caml_win32_get_temp_path();
+#else
+  return caml_copy_string("");
 #endif
 }

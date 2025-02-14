@@ -19,6 +19,7 @@
 /* Must be preprocessed by cpp */
 
 #include "caml/m.h"
+#include "caml/asm.h"
 
 /* Special registers */
 
@@ -36,38 +37,9 @@
 #define C_ARG_3 x2
 #define C_ARG_4 x3
 
-/* Support for CFI directives */
-
-#if defined(ASM_CFI_SUPPORTED)
-#define CFI_STARTPROC .cfi_startproc
-#define CFI_ENDPROC .cfi_endproc
-#define CFI_ADJUST(n) .cfi_adjust_cfa_offset n
-#define CFI_REGISTER(r1,r2) .cfi_register r1,r2
-#define CFI_OFFSET(r,n) .cfi_offset r,n
-#define CFI_DEF_CFA_REGISTER(r) .cfi_def_cfa_register r
-#define CFI_SIGNAL_FRAME .cfi_signal_frame
-#define CFI_REMEMBER_STATE .cfi_remember_state
-#define CFI_RESTORE_STATE .cfi_restore_state
-#else
-#define CFI_STARTPROC
-#define CFI_ENDPROC
-#define CFI_ADJUST(n)
-#define CFI_REGISTER(r1,r2)
-#define CFI_OFFSET(r,n)
-#define CFI_DEF_CFA_REGISTER(r)
-#define CFI_SIGNAL_FRAME
-#define CFI_REMEMBER_STATE
-#define CFI_RESTORE_STATE
-#endif
-
 /* DWARF
 
-   These constants are taken from:
-
-     DWARF Debugging Information Format, Version 3
-     http://dwarfstd.org/doc/Dwarf3.pdf
-
-   with the ARM64 specific register numbers coming from
+   These ARM64 specific register numbers are coming from
    Table 4 ("Mapping from DWARF register numbers to Arm
    64-bit architecture registers") of:
 
@@ -75,12 +47,9 @@
 
  */
 
-#define DW_CFA_def_cfa_expression 0x0f
 #define DW_REG_x21                21
+#define DW_REG_x29                29
 #define DW_REG_sp                 31
-#define DW_OP_breg                0x70
-#define DW_OP_deref               0x06
-#define DW_OP_plus_uconst         0x23
 
 
         .set    domain_curr_field, 0
@@ -135,13 +104,13 @@
 #endif
 
 #if defined(FUNCTION_SECTIONS)
-        TEXT_SECTION(caml_hot.code_begin)
-        .globl  G(caml_hot.code_begin)
-G(caml_hot.code_begin):
+        TEXT_SECTION(caml_hot$code_begin)
+        .globl  G(caml_hot$code_begin)
+G(caml_hot$code_begin):
 
-        TEXT_SECTION(caml_hot.code_end)
-        .globl  G(caml_hot.code_end)
-G(caml_hot.code_end):
+        TEXT_SECTION(caml_hot$code_end)
+        .globl  G(caml_hot$code_end)
+G(caml_hot$code_end):
 #endif
 
 #if defined(SYS_macosx)
@@ -170,20 +139,35 @@ G(\name):
         TEXT_SECTION(name); \
         .align  2; \
         .globl  G(name); \
-        .type   G(name), %function; \
+        TYPE_DIRECTIVE(G(name),%function) \
 G(name):
 #define END_FUNCTION(name) \
-        .size   G(name), .-G(name)
+        SIZE_DIRECTIVE(G(name))
 
 #define OBJECT(name) \
         .data; \
         .align  3; \
         .globl  G(name); \
-        .type   G(name), %object; \
+        TYPE_DIRECTIVE(G(name),%object) \
 G(name):
 #define END_OBJECT(name) \
-        .size   G(name), .-G(name)
+        SIZE_DIRECTIVE(G(name))
 #endif
+
+/* Function prologue and epilogue */
+
+.macro ENTER_FUNCTION
+        CFI_OFFSET(29, -16)
+        CFI_OFFSET(30, -8)
+        stp     x29, x30, [sp, -16]!
+        CFI_ADJUST(16)
+        add     x29, sp, #0
+.endm
+
+.macro LEAVE_FUNCTION
+        ldp     x29, x30, [sp], 16
+        CFI_ADJUST(-16)
+.endm
 
 /* Stack switching operations */
 
@@ -207,7 +191,12 @@ G(name):
 #define Handler_parent(reg)     [reg, #24]
 #define Handler_parent_offset   24
 
-/* Switch from OCaml to C stack. */
+/* Switch from OCaml to C stack.
+
+   If a C function is called which might call back into OCaml,
+   then nothing may be pushed to the C stack between SWITCH_OCAML_TO_C
+   and the next C call. (This is to ensure frame pointers are correctly
+   maintained if the stack is reallocated) */
 .macro SWITCH_OCAML_TO_C
     /* Fill in Caml_state->current_stack->sp */
         ldr     TMP, Caml_state(current_stack)
@@ -318,6 +307,32 @@ G(name):
         ldr     ALLOC_PTR, Caml_state(young_ptr)
         ldr     TRAP_PTR, Caml_state(exn_handler)
 .endm
+
+/* Updates the oldest saved frame pointer in the target fiber.
+
+   A fiber stack may need to grow, causing the reallocation of the entire fiber,
+   including stack_info and stack_handler structures.
+   caml_try_realloc_stack will not be able to update the linked list of
+   frame-pointers if it has been split (i.e., in a continuation).
+   caml_resume and caml_reperform use this macro to update the oldest saved x29
+   (highest one in the stack) in case the fiber was reallocated to reattach the
+   frame-pointer linked list.
+
+   REG: Stack_handler(target_fiber)
+
+   The frame pointer will be pushed into the stack immediately after these
+   instructions. The offset of the oldest saved x29 in a fiber from the stack
+   handler is 48 = 4 words (caml_runstack) + 2 words (x30 and x29).
+   */
+#ifdef WITH_FRAME_POINTERS
+.macro UPDATE_BASE_POINTER reg
+        sub     TMP2, sp, 16
+        str     TMP2, [\reg, -48]
+.endm
+#else
+.macro UPDATE_BASE_POINTER reg
+.endm
+#endif
 
 #if defined(WITH_THREAD_SANITIZER) /* { */
 
@@ -443,19 +458,18 @@ G(name):
 
 #endif /* } WITH_THREAD_SANITIZER */
 
-/* Allocation functions and GC interface */
+/* Allocation functions and GC interface.
+   Referenced from C code in runtime/startup_nat.c
+ */
         TEXT_SECTION(caml_system__code_begin)
         .globl  G(caml_system__code_begin)
 G(caml_system__code_begin):
 
 FUNCTION(caml_call_realloc_stack)
         CFI_STARTPROC
+        CFI_SIGNAL_FRAME
     /* Save return address and frame pointer */
-        CFI_OFFSET(29, -16)
-        CFI_OFFSET(30, -8)
-        stp     x29, x30, [sp, -16]!
-        CFI_ADJUST(16)
-        add     x29, sp, #0
+        ENTER_FUNCTION
     /* Save all registers (including ALLOC_PTR & TRAP_PTR) */
         SAVE_ALL_REGS
         ldr     C_ARG_1, [sp, 16] /* argument */
@@ -465,38 +479,37 @@ FUNCTION(caml_call_realloc_stack)
         cbz     x0, 1f
         RESTORE_ALL_REGS
     /* Free stack space and return to caller */
-        ldp     x29, x30, [sp], 16
+        LEAVE_FUNCTION
         ret
 1:      RESTORE_ALL_REGS
     /* Raise the Stack_overflow exception */
-        ldp     x29, x30, [sp], 16
+        LEAVE_FUNCTION
         add     sp, sp, 16 /* pop argument */
         ADDRGLOBAL(x0, caml_exn_Stack_overflow)
         b       G(caml_raise_exn)
         CFI_ENDPROC
-        END_FUNCTION(caml_call_realloc_stack)
+END_FUNCTION(caml_call_realloc_stack)
 
 FUNCTION(caml_call_gc)
         CFI_STARTPROC
 L(caml_call_gc):
+        CFI_SIGNAL_FRAME
     /* Save return address and frame pointer */
-        CFI_OFFSET(29, -16)
-        CFI_OFFSET(30, -8)
-        stp     x29, x30, [sp, -16]!
-        CFI_ADJUST(16)
-        add     x29, sp, #0
+        ENTER_FUNCTION
     /* Store all registers (including ALLOC_PTR & TRAP_PTR) */
         SAVE_ALL_REGS
+        TSAN_ENTER_FUNCTION
         SWITCH_OCAML_TO_C
     /* Call the garbage collector */
         bl      G(caml_garbage_collection)
         SWITCH_C_TO_OCAML
+        TSAN_EXIT_FUNCTION
         RESTORE_ALL_REGS
     /* Free stack space and return to caller */
-        ldp     x29, x30, [sp], 16
+        LEAVE_FUNCTION
         ret
         CFI_ENDPROC
-        END_FUNCTION(caml_call_gc)
+END_FUNCTION(caml_call_gc)
 
 FUNCTION(caml_alloc1)
         CFI_STARTPROC
@@ -506,7 +519,7 @@ FUNCTION(caml_alloc1)
         b.lo    L(caml_call_gc)
         ret
         CFI_ENDPROC
-        END_FUNCTION(caml_alloc1)
+END_FUNCTION(caml_alloc1)
 
 FUNCTION(caml_alloc2)
         CFI_STARTPROC
@@ -516,7 +529,7 @@ FUNCTION(caml_alloc2)
         b.lo    L(caml_call_gc)
         ret
         CFI_ENDPROC
-        END_FUNCTION(caml_alloc2)
+END_FUNCTION(caml_alloc2)
 
 FUNCTION(caml_alloc3)
         CFI_STARTPROC
@@ -526,7 +539,7 @@ FUNCTION(caml_alloc3)
         b.lo    L(caml_call_gc)
         ret
         CFI_ENDPROC
-        END_FUNCTION(caml_alloc3)
+END_FUNCTION(caml_alloc3)
 
 FUNCTION(caml_allocN)
         CFI_STARTPROC
@@ -536,7 +549,7 @@ FUNCTION(caml_allocN)
         b.lo    L(caml_call_gc)
         ret
         CFI_ENDPROC
-        END_FUNCTION(caml_allocN)
+END_FUNCTION(caml_allocN)
 
 /* Call a C function from OCaml */
 /* Function to call is in ADDITIONAL_ARG */
@@ -552,11 +565,8 @@ FUNCTION(caml_allocN)
 
 FUNCTION(caml_c_call)
         CFI_STARTPROC
-        CFI_OFFSET(29, -16)
-        CFI_OFFSET(30, -8)
-        stp     x29, x30, [sp, -16]!
-        CFI_ADJUST(16)
-        add     x29, sp, #0
+        CFI_SIGNAL_FRAME
+        ENTER_FUNCTION
         TSAN_SAVE_CALLER_REGS
         TSAN_ENTER_FUNCTION
         TSAN_RESTORE_CALLER_REGS
@@ -567,8 +577,9 @@ FUNCTION(caml_c_call)
         str     TRAP_PTR, Caml_state(exn_handler)
     /* Call the function */
         blr     ADDITIONAL_ARG
-    /* Reload alloc ptr  */
+    /* Reload new allocation pointer & exn handler */
         ldr     ALLOC_PTR, Caml_state(young_ptr)
+        ldr     TRAP_PTR, Caml_state(exn_handler)
     /* Load ocaml stack */
         SWITCH_C_TO_OCAML
 #if defined(WITH_THREAD_SANITIZER)
@@ -587,56 +598,72 @@ FUNCTION(caml_c_call)
         CFI_ADJUST(-16)
 #endif
     /* Return */
-        ldp     x29, x30, [sp], 16
+        LEAVE_FUNCTION
         RET_FROM_C_CALL
         CFI_ENDPROC
 END_FUNCTION(caml_c_call)
 
 FUNCTION(caml_c_call_stack_args)
         CFI_STARTPROC
+        CFI_SIGNAL_FRAME
     /* Arguments:
         C arguments  : x0 to x7, d0 to d7
         C function   : ADDITIONAL_ARG
         C stack args : begin=STACK_ARG_BEGIN
                        end=STACK_ARG_END */
-        CFI_OFFSET(29, -16)
-        CFI_OFFSET(30, -8)
-        stp     x29, x30, [sp, -16]!
-        CFI_ADJUST(16)
-        add     x29, sp, #0
+        ENTER_FUNCTION
     /* Switch from OCaml to C */
         SWITCH_OCAML_TO_C
     /* Make the exception handler alloc ptr available to the C code */
         str     ALLOC_PTR, Caml_state(young_ptr)
         str     TRAP_PTR, Caml_state(exn_handler)
-    /* Store sp to restore after call */
-        mov     x19, sp
+    /* Copy the arguments and call */
+        bl      G(caml_c_call_copy_stack_args)
+    /* Reload new allocation pointer & exn handler */
+        ldr     ALLOC_PTR, Caml_state(young_ptr)
+        ldr     TRAP_PTR, Caml_state(exn_handler)
+    /* Switch from C to OCaml */
+        SWITCH_C_TO_OCAML
+    /* Return */
+        LEAVE_FUNCTION
+        RET_FROM_C_CALL
+        CFI_ENDPROC
+END_FUNCTION(caml_c_call_stack_args)
+
+/* To correctly maintain frame pointers during stack reallocation,
+   the runtime assumes that the caml_c_call stub does not push
+   anything to the stack before the first frame pointer on the C stack.
+   To guarantee this when stack arguments are used, the actual pushing
+   of arguments is done by this separate function */
+FUNCTION(caml_c_call_copy_stack_args)
+        CFI_STARTPROC
+        ENTER_FUNCTION
+        CFI_DEF_CFA_REGISTER(DW_REG_x29)
     /* Copy arguments from OCaml to C stack
        NB: STACK_ARG_{BEGIN,END} are 16-byte aligned */
 1:      sub     STACK_ARG_END, STACK_ARG_END, 16
         cmp     STACK_ARG_END, STACK_ARG_BEGIN
         b.lo    2f
         ldp     TMP, TMP2, [STACK_ARG_END]
-        stp     TMP, TMP2, [sp, -16]!; CFI_ADJUST(16)
+        stp     TMP, TMP2, [sp, -16]!
         b       1b
 2:  /* Call the function */
         blr     ADDITIONAL_ARG
     /* Restore stack */
-        mov     sp, x19
-    /* Reload alloc ptr */
-        ldr     ALLOC_PTR, Caml_state(young_ptr)
-    /* Switch from C to OCaml */
-        SWITCH_C_TO_OCAML
-    /* Return */
-        ldp     x29, x30, [sp], 16
-        RET_FROM_C_CALL
+        mov     sp, x29
+        CFI_DEF_CFA_REGISTER(DW_REG_sp)
+        LEAVE_FUNCTION
+        ret
         CFI_ENDPROC
-END_FUNCTION(caml_c_call_stack_args)
+END_FUNCTION(caml_c_call_copy_stack_args)
+
 
 /* Start the OCaml program */
 
 FUNCTION(caml_start_program)
         CFI_STARTPROC
+        CFI_SIGNAL_FRAME
+
 #if defined(WITH_THREAD_SANITIZER)
         str     x0, [sp, -16]!
         CFI_ADJUST(16)
@@ -651,6 +678,7 @@ FUNCTION(caml_start_program)
 #endif
     /* domain state is passed as arg from C */
         mov     TMP, C_ARG_1
+    /* Initial entry point is caml_program */
         ADDRGLOBAL(TMP2, caml_program)
 
 /* Code shared with caml_callback* */
@@ -664,7 +692,7 @@ L(jump_to_caml):
         CFI_OFFSET(30, -152)
         stp     x29, x30, [sp, -160]!
         CFI_ADJUST(160)
-        add     x29, sp, #0
+        mov     x29, sp
         stp     x19, x20, [sp, 16]
         stp     x21, x22, [sp, 32]
         stp     x23, x24, [sp, 48]
@@ -767,7 +795,7 @@ L(return_result):
     /* Return to C caller */
         ret
         CFI_ENDPROC
-        END_FUNCTION(caml_start_program)
+END_FUNCTION(caml_start_program)
 
 /* The trap handler */
 
@@ -788,8 +816,7 @@ L(trap_handler):
     /* Cut stack at current trap handler */
         mov     sp, TRAP_PTR
     /* Pop previous handler and jump to it */
-        ldr     TMP, [sp, 8]
-        ldr     TRAP_PTR, [sp], 16
+        ldp     TRAP_PTR, TMP, [sp], 16
         br      TMP
 .endm
 
@@ -819,7 +846,7 @@ L(caml_reraise_exn_stash):
         mov     x0, x19
         b       1b
         CFI_ENDPROC
-        END_FUNCTION(caml_raise_exn)
+END_FUNCTION(caml_raise_exn)
 
 FUNCTION(caml_reraise_exn)
         CFI_STARTPROC
@@ -827,7 +854,7 @@ FUNCTION(caml_reraise_exn)
         cbnz    TMP, L(caml_reraise_exn_stash)
         JUMP_TO_TRAP_PTR
         CFI_ENDPROC
-        END_FUNCTION(caml_reraise_exn)
+END_FUNCTION(caml_reraise_exn)
 
 #if defined(WITH_THREAD_SANITIZER)
 /* When TSan support is enabled, this routine should be called just before
@@ -843,7 +870,7 @@ FUNCTION(caml_tsan_exit_on_raise_asm)
         TSAN_C_CALL G(caml_tsan_exit_on_raise)
         ret
         CFI_ENDPROC
-        END_FUNCTION(caml_tsan_exit_on_raise_asm)
+END_FUNCTION(caml_tsan_exit_on_raise_asm)
 #endif
 
 /* Raise an exception from C */
@@ -878,10 +905,10 @@ FUNCTION(caml_raise_exception)
         CFI_ADJUST(-16)
 #endif
     /* Restore frame and link on return to OCaml */
-        ldp     x29, x30, [sp], 16
+        LEAVE_FUNCTION
         b       G(caml_raise_exn)
         CFI_ENDPROC
-        END_FUNCTION(caml_raise_exception)
+END_FUNCTION(caml_raise_exception)
 
 /* Callback from C to OCaml */
 
@@ -908,7 +935,7 @@ FUNCTION(caml_callback_asm)
         ldr     TMP2, [x1]       /* code pointer */
         b       L(jump_to_caml)
         CFI_ENDPROC
-        END_FUNCTION(caml_callback_asm)
+END_FUNCTION(caml_callback_asm)
 
 FUNCTION(caml_callback2_asm)
         CFI_STARTPROC
@@ -934,7 +961,7 @@ FUNCTION(caml_callback2_asm)
         ADDRGLOBAL(TMP2, caml_apply2)
         b       L(jump_to_caml)
         CFI_ENDPROC
-        END_FUNCTION(caml_callback2_asm)
+END_FUNCTION(caml_callback2_asm)
 
 FUNCTION(caml_callback3_asm)
         CFI_STARTPROC
@@ -961,7 +988,7 @@ FUNCTION(caml_callback3_asm)
         ADDRGLOBAL(TMP2, caml_apply3)
         b       L(jump_to_caml)
         CFI_ENDPROC
-        END_FUNCTION(caml_callback3_asm)
+END_FUNCTION(caml_callback3_asm)
 
 /* Fibers */
 
@@ -969,9 +996,7 @@ FUNCTION(caml_callback3_asm)
    Preserves old_stack and new_stack registers */
 .macro SWITCH_OCAML_STACKS old_stack, new_stack
     /* Save frame pointer and return address for old_stack */
-        stp     x29, x30, [sp, -16]!
-        CFI_ADJUST(16)
-        add     x29, sp, #0
+        ENTER_FUNCTION
     /* Save OCaml SP and exn_handler in the stack info */
         mov     TMP, sp
         str     TMP, Stack_sp(\old_stack)
@@ -983,10 +1008,8 @@ FUNCTION(caml_callback3_asm)
     /* restore exn_handler for new stack */
         ldr     TRAP_PTR, Stack_exception(\new_stack)
     /* Restore frame pointer and return address for new_stack */
-        ldp     x29, x30, [sp], 16
-        CFI_ADJUST(-16)
+        LEAVE_FUNCTION
 .endm
-
 
 /*
  * A continuation is a one word object that points to a fiber. A fiber [f] will
@@ -1015,6 +1038,7 @@ L(do_perform):
         TSAN_C_CALL G(caml_tsan_exit_on_perform)
         TSAN_RESTORE_CALLER_REGS
 #endif
+        str     x3, [x1, 8] /* Set the last_fiber field in the continuation */
         ldr     x9, Stack_handler(x2)  /* x9 := old stack -> handler */
         ldr     x10, Handler_parent(x9) /* x10 := parent stack */
         cbz     x10, 1f
@@ -1068,23 +1092,26 @@ L(do_perform):
         ADDRGLOBAL(ADDITIONAL_ARG, caml_raise_unhandled_effect)
         b       G(caml_c_call)
         CFI_ENDPROC
-        END_FUNCTION(caml_perform)
+END_FUNCTION(caml_perform)
 
 FUNCTION(caml_reperform)
         CFI_STARTPROC
-    /*  x0: effect to perform
+    /*  x0: effect to reperform
         x1: continuation
         x2: last_fiber */
         ldr     TMP, Stack_handler_from_cont(x2)
         ldr     x2, Caml_state(current_stack) /* x2 := old stack */
         str     x2, Handler_parent(TMP) /* Append to last_fiber */
         add     x3, x2, 1 /* x3 (last_fiber) := Val_ptr(old stack) */
+    /* Need to update the oldest saved frame pointer here as the execution of
+       the handler may have caused the current fiber stack to reallocate. */
+        UPDATE_BASE_POINTER TMP
         b       L(do_perform)
         CFI_ENDPROC
-        END_FUNCTION(caml_reperform)
+END_FUNCTION(caml_reperform)
 
 FUNCTION(caml_resume)
-CFI_STARTPROC
+        CFI_STARTPROC
     /*  x0: new fiber
         x1: fun
         x2: arg
@@ -1126,18 +1153,22 @@ CFI_STARTPROC
         ldr     x8, Stack_handler(x3)
         ldr     x9, Caml_state(current_stack)
         str     x9, Handler_parent(x8)
+    /* Need to update the oldest saved frame pointer here as the current fiber
+       stack may have been reallocated or we may be resuming a computation
+       that was not originally run here. */
+        UPDATE_BASE_POINTER x8
         SWITCH_OCAML_STACKS x9, x0
         mov     x0, x2
         br      x4
 1:      ADDRGLOBAL(ADDITIONAL_ARG, caml_raise_continuation_already_resumed)
         b       G(caml_c_call)
         CFI_ENDPROC
-        END_FUNCTION(caml_resume)
+END_FUNCTION(caml_resume)
 
 /* Run a function on a new stack, then either
    return the value or invoke exception handler */
 FUNCTION(caml_runstack)
-CFI_STARTPROC
+        CFI_STARTPROC
 #if defined(WITH_THREAD_SANITIZER)
     /* Save non-callee-saved registers x0, x1 and x2 */
         stp     x0, x1, [sp, -16]!
@@ -1151,14 +1182,11 @@ CFI_STARTPROC
         ldp     x0, x1, [sp], 16
         CFI_ADJUST(-16)
 #endif
+        CFI_SIGNAL_FRAME
     /*  x0: fiber
         x1: fun
         x2: arg */
-        CFI_OFFSET(29, -16)
-        CFI_OFFSET(30, -8)
-        stp     x29, x30, [sp, -16]!
-        CFI_ADJUST(16)
-        add     x29, sp, #0
+        ENTER_FUNCTION
         sub     x0, x0, 1  /* x0 := Ptr_val(x0) */
         ldr     x3, [x1]   /* code pointer */
     /*  save old stack pointer and exception handler */
@@ -1226,15 +1254,14 @@ L(frame_runstack):
         mov     x1, x19
         ldr     TMP, [x19]  /* code pointer */
     /* Invoke handle_value (or handle_exn) */
-        ldp     x29, x30, [sp], 16
-        CFI_ADJUST(-16)
+        LEAVE_FUNCTION
         br      TMP
 L(fiber_exn_handler):
         add     x8, sp, 16  /* x8 := stack_handler */
         ldr     x19, Handler_exception(x8)
         b       1b
         CFI_ENDPROC
-        END_FUNCTION(caml_runstack)
+END_FUNCTION(caml_runstack)
 
 FUNCTION(caml_ml_array_bound_error)
         CFI_STARTPROC
@@ -1243,15 +1270,15 @@ FUNCTION(caml_ml_array_bound_error)
     /* Call that function */
         b       G(caml_c_call)
         CFI_ENDPROC
-        END_FUNCTION(caml_ml_array_bound_error)
+END_FUNCTION(caml_ml_array_bound_error)
 
          TEXT_SECTION(caml_system__code_end)
         .globl  G(caml_system__code_end)
 G(caml_system__code_end):
 
-/* GC roots for callback */
-
-OBJECT(caml_system.frametable)
+/* Frametable - GC roots for callback */
+/* Uses the same naming convention as ocamlopt generated modules. */
+OBJECT(caml_system$frametable)
         .quad   2               /* two descriptors */
         .quad   L(caml_retaddr) /* return address into callback */
         .short  -1              /* negative frame size => use callback link */
@@ -1261,9 +1288,6 @@ OBJECT(caml_system.frametable)
         .short  -1              /* negative frame size => use callback link */
         .short  0               /* no roots here */
         .align 3
-        END_OBJECT(caml_system.frametable)
+        END_OBJECT(caml_system$frametable)
 
-#if !defined(SYS_macosx)
-/* Mark stack as non-executable */
-        .section .note.GNU-stack,"",%progbits
-#endif
+        NONEXECSTACK_NOTE

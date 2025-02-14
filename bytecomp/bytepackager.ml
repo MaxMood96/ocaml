@@ -172,13 +172,13 @@ let rename_append_bytecode packagename oc state objfile compunit =
     let events, debug_dirs =
       if !Clflags.debug && compunit.cu_debug > 0 then begin
         seek_in ic compunit.cu_debug;
-        let unit_events = (input_value ic : debug_event list) in
+        let unit_events = (Compression.input_value ic : debug_event list) in
         let events =
           rev_append_map
             (relocate_debug state.offset packagename state.subst)
             unit_events
             state.events in
-        let unit_debug_dirs = (input_value ic : string list) in
+        let unit_debug_dirs = (Compression.input_value ic : string list) in
         let debug_dirs =
           String.Set.union
             state.debug_dirs
@@ -291,9 +291,8 @@ let package_object_files ~ppf_dump files target coercion =
       build_global_target ~ppf_dump oc targetname state components coercion in
     let pos_debug = pos_out oc in
     if !Clflags.debug && state.events <> [] then begin
-      Marshal.(to_channel oc (List.rev state.events) [Compression]);
-      Marshal.(to_channel oc (String.Set.elements state.debug_dirs)
-                             [Compression]);
+      Compression.output_value oc (List.rev state.events);
+      Compression.output_value oc (String.Set.elements state.debug_dirs)
     end;
     let force_link =
       List.exists (function
@@ -345,25 +344,25 @@ let package_files ~ppf_dump initial_env files targetfile =
 
 (* Error report *)
 
-open Format
+open Format_doc
 module Style = Misc.Style
 
-let report_error ppf = function
+let report_error_doc ppf = function
     Forward_reference(file, compunit) ->
       fprintf ppf "Forward reference to %a in file %a"
         Style.inline_code (Compunit.name compunit)
-        (Style.as_inline_code Location.print_filename) file
+        Location.Doc.quoted_filename file
   | Multiple_definition(file, compunit) ->
       fprintf ppf "File %a redefines %a"
-        (Style.as_inline_code Location.print_filename) file
+        Location.Doc.quoted_filename file
         Style.inline_code (Compunit.name compunit)
   | Not_an_object_file file ->
       fprintf ppf "%a is not a bytecode object file"
-        (Style.as_inline_code Location.print_filename) file
+        Location.Doc.quoted_filename file
   | Illegal_renaming(name, file, id) ->
       fprintf ppf "Wrong file naming: %a@ contains the code for\
                    @ %a when %a was expected"
-        (Style.as_inline_code Location.print_filename) file
+        Location.Doc.quoted_filename file
         Style.inline_code (Compunit.name name)
         Style.inline_code (Compunit.name id)
   | File_not_found file ->
@@ -373,6 +372,8 @@ let report_error ppf = function
 let () =
   Location.register_error_of_exn
     (function
-      | Error err -> Some (Location.error_of_printer_file report_error err)
+      | Error err -> Some (Location.error_of_printer_file report_error_doc err)
       | _ -> None
     )
+
+let report_error = Format_doc.compat report_error_doc

@@ -20,11 +20,16 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdalign.h>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include "caml/config.h"
 #include "caml/custom.h"
 #include "caml/misc.h"
 #include "caml/fail.h"
 #include "caml/memory.h"
+#include "caml/memprof.h"
 #include "caml/major_gc.h"
 #include "caml/signals.h"
 #include "caml/shared_heap.h"
@@ -286,7 +291,7 @@ CAMLexport void caml_adjust_minor_gc_speed (mlsize_t res, mlsize_t max)
   }
 }
 
-/* You must use [caml_intialize] to store the initial value in a field of a
+/* You must use [caml_initialize] to store the initial value in a field of a
    block, unless you are sure the value is not a young block, in which case a
    plain assignment would do.
 
@@ -301,7 +306,8 @@ CAMLexport CAMLweakdef void caml_initialize (volatile value *fp, value val)
   /* Previous value should not be a pointer.
      In the debug runtime, it can be either a TMC placeholder,
      or an uninitialized value canary (Debug_uninit_{major,minor}). */
-  CAMLassert(Is_long(*fp));
+  CAMLassert(Is_long(*fp) || *fp == Debug_uninit_major
+             || *fp == Debug_uninit_minor);
 #endif
   *fp = val;
   if (!Is_young((value)fp) && Is_block_and_young (val))
@@ -409,10 +415,9 @@ CAMLprim value caml_atomic_fetch_add (value ref, value incr)
 
 CAMLexport void caml_set_fields (value obj, value v)
 {
-  int i;
   CAMLassert (Is_block(obj));
 
-  for (i = 0; i < Wosize_val(obj); i++) {
+  for (int i = 0; i < Wosize_val(obj); i++) {
     caml_modify(&Field(obj, i), v);
   }
 }
@@ -432,18 +437,22 @@ Caml_inline value alloc_shr(mlsize_t wosize, tag_t tag, reserved_t reserved,
   }
 
   dom_st->allocated_words += Whsize_wosize(wosize);
-  if (dom_st->allocated_words > dom_st->minor_heap_wsz / 5) {
+  dom_st->allocated_words_direct += Whsize_wosize(wosize);
+  if (dom_st->allocated_words_direct > dom_st->minor_heap_wsz / 5) {
     CAML_EV_COUNTER (EV_C_REQUEST_MAJOR_ALLOC_SHR, 1);
     caml_request_major_slice(1);
   }
 
 #ifdef DEBUG
   if (tag < No_scan_tag) {
-    mlsize_t i;
-    for (i = 0; i < wosize; i++)
+    for (mlsize_t i = 0; i < wosize; i++)
       Op_hp(v)[i] = Debug_uninit_major;
   }
 #endif
+  caml_memprof_sample_block(Val_hp(v), wosize,
+                            Whsize_wosize(wosize),
+                            CAML_MEMPROF_SRC_NORMAL);
+
   return Val_hp(v);
 }
 
@@ -481,28 +490,23 @@ CAMLexport value caml_alloc_shr_noexc(mlsize_t wosize, tag_t tag) {
    the implementation from the user.
 */
 
-/* A type with the most strict alignment requirements */
-union max_align {
-  char c;
-  short s;
-  long l;
-  int i;
-  float f;
-  double d;
-  void *v;
-  void (*q)(void);
-};
+#if !defined(HAVE_MAX_ALIGN_T) && defined(_MSC_VER)
+typedef double max_align_t;
+#endif
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+#if defined(_M_AMD64) || defined(__x86_64__)
+#define pool_block_align MAX(alignof(max_align_t), 16 /* for SSE */)
+#else
+#define pool_block_align alignof(max_align_t)
+#endif
 
 struct pool_block {
-#ifdef DEBUG
-  intnat magic;
-#endif
   struct pool_block *next;
   struct pool_block *prev;
-  union max_align data[];  /* not allocated, used for alignment purposes */
+  alignas(pool_block_align) char data[]; /* flexible array member */
 };
-
-#define SIZEOF_POOL_BLOCK sizeof(struct pool_block)
 
 static struct pool_block *pool = NULL;
 static caml_plat_mutex pool_mutex = CAML_PLAT_MUTEX_INITIALIZER;
@@ -510,23 +514,18 @@ static caml_plat_mutex pool_mutex = CAML_PLAT_MUTEX_INITIALIZER;
 /* Returns a pointer to the block header, given a pointer to "data" */
 static struct pool_block* get_pool_block(caml_stat_block b)
 {
-  if (b == NULL)
+  if (b == NULL) {
     return NULL;
-
-  else {
-    struct pool_block *pb =
-      (struct pool_block*)(((char*)b) - SIZEOF_POOL_BLOCK);
-#ifdef DEBUG
-    CAMLassert(pb->magic == Debug_pool_magic);
-#endif
-    return pb;
+  } else {
+    return (struct pool_block *)
+      (((char *) b) - offsetof(struct pool_block, data));
   }
 }
 
 /* Linking a pool block into the ring */
 static void link_pool_block(struct pool_block *pb)
 {
-  caml_plat_lock(&pool_mutex);
+  caml_plat_lock_blocking(&pool_mutex);
   pb->next = pool->next;
   pb->prev = pool;
   pool->next->prev = pb;
@@ -537,7 +536,7 @@ static void link_pool_block(struct pool_block *pb)
 /* Unlinking a pool block from the ring */
 static void unlink_pool_block(struct pool_block *pb)
 {
-    caml_plat_lock(&pool_mutex);
+    caml_plat_lock_blocking(&pool_mutex);
     pb->prev->next = pb->next;
     pb->next->prev = pb->prev;
     caml_plat_unlock(&pool_mutex);
@@ -546,12 +545,9 @@ static void unlink_pool_block(struct pool_block *pb)
 CAMLexport void caml_stat_create_pool(void)
 {
   if (pool == NULL) {
-    pool = malloc(SIZEOF_POOL_BLOCK);
+    pool = malloc(sizeof(struct pool_block));
     if (pool == NULL)
       caml_fatal_error("Fatal error: out of memory.\n");
-#ifdef DEBUG
-    pool->magic = Debug_pool_magic;
-#endif
     pool->next = pool;
     pool->prev = pool;
   }
@@ -559,12 +555,16 @@ CAMLexport void caml_stat_create_pool(void)
 
 CAMLexport void caml_stat_destroy_pool(void)
 {
-  caml_plat_lock(&pool_mutex);
+  caml_plat_lock_blocking(&pool_mutex);
   if (pool != NULL) {
     pool->prev->next = NULL;
     while (pool != NULL) {
       struct pool_block *next = pool->next;
+#ifdef _WIN32
+      _aligned_free(pool);
+#else
       free(pool);
+#endif
       pool = next;
     }
     pool = NULL;
@@ -579,12 +579,13 @@ CAMLexport caml_stat_block caml_stat_alloc_noexc(asize_t sz)
   if (pool == NULL)
     return malloc(sz);
   else {
-    struct pool_block *pb = malloc(sz + SIZEOF_POOL_BLOCK);
-    if (pb == NULL) return NULL;
-#ifdef DEBUG
-    memset(&(pb->data), Debug_uninit_stat, sz);
-    pb->magic = Debug_pool_magic;
+    struct pool_block *pb;
+#ifdef _WIN32
+    pb = _aligned_malloc(sizeof(struct pool_block) + sz, pool_block_align);
+#else
+    pb = malloc(sizeof(struct pool_block) + sz);
 #endif
+    if (pb == NULL) return NULL;
     link_pool_block(pb);
     return &(pb->data);
   }
@@ -596,7 +597,8 @@ CAMLexport void* caml_stat_alloc_aligned_noexc(asize_t sz, int modulo,
 {
   char *raw_mem;
   uintnat aligned_mem;
-  CAMLassert (0 <= modulo && modulo < Page_size);
+  CAMLassert(0 <= modulo);
+  CAMLassert(modulo < Page_size);
   raw_mem = (char *) caml_stat_alloc_noexc(sz + Page_size);
   if (raw_mem == NULL) return NULL;
   *b = raw_mem;
@@ -604,14 +606,13 @@ CAMLexport void* caml_stat_alloc_aligned_noexc(asize_t sz, int modulo,
   aligned_mem = (((uintnat) raw_mem / Page_size + 1) * Page_size);
 #ifdef DEBUG
   {
-    uintnat *p;
     uintnat *p0 = (void *) *b;
     uintnat *p1 = (void *) (aligned_mem - modulo);
     uintnat *p2 = (void *) (aligned_mem - modulo + sz);
     uintnat *p3 = (void *) ((char *) *b + sz + Page_size);
-    for (p = p0; p < p1; p++) *p = Debug_filler_align;
-    for (p = p1; p < p2; p++) *p = Debug_uninit_align;
-    for (p = p2; p < p3; p++) *p = Debug_filler_align;
+    for (uintnat *p = p0; p < p1; p++) *p = Debug_filler_align;
+    for (uintnat *p = p1; p < p2; p++) *p = Debug_uninit_align;
+    for (uintnat *p = p2; p < p3; p++) *p = Debug_filler_align;
   }
 #endif
   return (char *) (aligned_mem - modulo);
@@ -647,7 +648,11 @@ CAMLexport void caml_stat_free(caml_stat_block b)
     struct pool_block *pb = get_pool_block(b);
     if (pb == NULL) return;
     unlink_pool_block(pb);
+#ifdef _WIN32
+    _aligned_free(pb);
+#else
     free(pb);
+#endif
   }
 }
 
@@ -666,7 +671,12 @@ CAMLexport caml_stat_block caml_stat_resize_noexc(caml_stat_block b, asize_t sz)
        while other domains access the pool concurrently. */
     unlink_pool_block(pb);
     /* Reallocating */
-    pb_new = realloc(pb, sz + SIZEOF_POOL_BLOCK);
+#ifdef _WIN32
+    pb_new = _aligned_realloc(pb, sizeof(struct pool_block) + sz,
+                              pool_block_align);
+#else
+    pb_new = realloc(pb, sizeof(struct pool_block) + sz);
+#endif
     if (pb_new == NULL) {
       /* The old block is still there, relinking it */
       link_pool_block(pb);
@@ -719,15 +729,34 @@ CAMLexport caml_stat_string caml_stat_strdup(const char *s)
   return result;
 }
 
+CAMLexport caml_stat_string caml_stat_memdup(const char *s, asize_t size,
+                                             asize_t *out_size)
+{
+  CAMLassert(size > 0);
+  caml_stat_block result = caml_stat_alloc(size);
+  memcpy(result, s, size);
+  if (out_size != NULL)
+    *out_size = size;
+  return result;
+}
+
 #ifdef _WIN32
+
+CAMLexport wchar_t * caml_stat_wcsdup_noexc(const wchar_t *s)
+{
+  size_t slen = wcslen(s);
+  wchar_t* result = caml_stat_alloc_noexc((slen + 1)*sizeof(wchar_t));
+  if (result == NULL)
+    return NULL;
+  memcpy(result, s, (slen + 1)*sizeof(wchar_t));
+  return result;
+}
 
 CAMLexport wchar_t * caml_stat_wcsdup(const wchar_t *s)
 {
-  int slen = wcslen(s);
-  wchar_t* result = caml_stat_alloc((slen + 1)*sizeof(wchar_t));
+  wchar_t* result = caml_stat_wcsdup_noexc(s);
   if (result == NULL)
     caml_raise_out_of_memory();
-  memcpy(result, s, (slen + 1)*sizeof(wchar_t));
   return result;
 }
 
@@ -738,10 +767,9 @@ CAMLexport caml_stat_string caml_stat_strconcat(int n, ...)
   va_list args;
   char *result, *p;
   size_t len = 0;
-  int i;
 
   va_start(args, n);
-  for (i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++) {
     const char *s = va_arg(args, const char*);
     len += strlen(s);
   }
@@ -751,7 +779,7 @@ CAMLexport caml_stat_string caml_stat_strconcat(int n, ...)
 
   va_start(args, n);
   p = result;
-  for (i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++) {
     const char *s = va_arg(args, const char*);
     size_t l = strlen(s);
     memcpy(p, s, l);
@@ -770,10 +798,9 @@ CAMLexport wchar_t* caml_stat_wcsconcat(int n, ...)
   va_list args;
   wchar_t *result, *p;
   size_t len = 0;
-  int i;
 
   va_start(args, n);
-  for (i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++) {
     const wchar_t *s = va_arg(args, const wchar_t*);
     len += wcslen(s);
   }
@@ -783,7 +810,7 @@ CAMLexport wchar_t* caml_stat_wcsconcat(int n, ...)
 
   va_start(args, n);
   p = result;
-  for (i = 0; i < n; i++) {
+  for (int i = 0; i < n; i++) {
     const wchar_t *s = va_arg(args, const wchar_t*);
     size_t l = wcslen(s);
     memcpy(p, s, l*sizeof(wchar_t));

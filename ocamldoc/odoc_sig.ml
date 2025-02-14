@@ -121,7 +121,9 @@ module type Info_retriever =
 let alert_of_attribute attr =
   let open Parsetree in
   let load_constant_string = function
-    | { pexp_desc = Pexp_constant (Pconst_string (text, _, _)); _ } -> Some text
+    | { pexp_desc = Pexp_constant
+            { pconst_desc = Pconst_string (text, _, _); _ }; _ } ->
+        Some text
     | _ -> None
   in
   let load_alert_name name = Longident.last name.Location.txt in
@@ -1885,7 +1887,7 @@ module Analyser =
         (ast : Parsetree.signature) (signat : Types.signature) =
       prepare_file source_file input_file;
       (* We create the t_module for this file. *)
-      let mod_name = Unit_info.modname_from_source source_file in
+      let mod_name = Unit_info.lax_modname_from_source source_file in
       let len, info_opt = preamble !file_name !file
           (fun x -> x.Parsetree.psig_loc) ast in
       let info_opt = analyze_toplevel_alerts info_opt ast in

@@ -1097,7 +1097,11 @@ val select :
    The result is composed of three sets of descriptors: those ready
    for reading (first component), ready for writing (second component),
    and over which an exceptional condition is pending (third
-   component). *)
+   component).
+
+   On Windows, if one of descriptor lists exceeds [FD_SETSIZE] elements
+   (64 by default), or if at least one non-socket file descriptor is
+   used, the maximal timeout is capped to 2{^32} milliseconds. *)
 
 (** {1 Locking} *)
 
@@ -1169,9 +1173,9 @@ val sigprocmask : mode:sigprocmask_command -> int list -> int list
    from the set of blocked signals.
    [sigprocmask] returns the set of previously blocked signals.
 
-   When the systhreads version of the [Thread] module is loaded, this
-   function redirects to [Thread.sigmask]. I.e., [sigprocmask] only
-   changes the mask of the current thread.
+   Each domain, and each thread when the [Thread] module is loaded,
+   has its own signal mask.  [sigprocmask] only changes the mask
+   of the current domain or current thread.
 
    @raise Invalid_argument on Windows (no inter-process signals on
    Windows) *)
@@ -1196,6 +1200,17 @@ val pause : unit -> unit
    @raise Invalid_argument on Windows (no inter-process signals on
    Windows) *)
 
+val sigwait : int list -> int
+(** [sigwait sigs] waits until one of the signals in the list [sigs]
+   becomes pending.  It then removes this signal from the set of pending
+   signals, and returns the number of this signal.
+   Signal handlers attached to the signals in [sigs] will not be
+   invoked.  The signals [sigs] are expected to be blocked before
+   calling [sigwait].
+
+   @since 5.4
+   @raise Invalid_argument on Windows (no inter-process signals on
+   Windows) *)
 
 (** {1 Time functions} *)
 
@@ -1587,7 +1602,7 @@ type socket_bool_option = Unix.socket_bool_option =
   | SO_ACCEPTCONN  (** Report whether socket listening is enabled *)
   | TCP_NODELAY    (** Control the Nagle algorithm for TCP sockets *)
   | IPV6_ONLY      (** Forbid binding an IPv6 socket to an IPv4 address *)
-  | SO_REUSEPORT   (** Allow reuse of address and port bindings *)
+  | SO_REUSEPORT   (** Allow reuse of address and port bindings. @since 4.12. *)
 (** The socket options that can be consulted with {!getsockopt}
    and modified with {!setsockopt}.  These options have a boolean
    ([true]/[false]) value. *)

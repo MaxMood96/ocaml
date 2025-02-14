@@ -29,7 +29,6 @@
 #define CAML_RUNTIME_EVENTS_H
 
 #include "mlvalues.h"
-#include <stdint.h>
 
 #ifdef CAML_INSTR
 #define CAML_EV_ALLOC(s) caml_ev_alloc(s)
@@ -59,6 +58,8 @@ typedef enum {
     EV_GC
 } ev_event_type;
 
+/* See runtime_events.mli for event documentation */
+
 typedef enum {
     EV_RING_START,
     EV_RING_STOP,
@@ -80,9 +81,12 @@ typedef enum {
     EV_MAJOR,
     EV_MAJOR_SWEEP,
     EV_MAJOR_MARK_ROOTS,
+    EV_MAJOR_MEMPROF_ROOTS,
     EV_MAJOR_MARK,
     EV_MINOR,
     EV_MINOR_LOCAL_ROOTS,
+    EV_MINOR_MEMPROF_ROOTS,
+    EV_MINOR_MEMPROF_CLEAN,
     EV_MINOR_FINALIZED,
     EV_EXPLICIT_GC_MAJOR_SLICE,
     EV_FINALISE_UPDATE_FIRST,
@@ -105,6 +109,7 @@ typedef enum {
     EV_STW_HANDLER,
     EV_STW_LEADER,
     EV_MAJOR_FINISH_SWEEPING,
+    EV_MAJOR_MEMPROF_CLEAN,
     EV_MINOR_FINALIZERS_ADMIN,
     EV_MINOR_REMEMBERED_SET,
     EV_MINOR_REMEMBERED_SET_PROMOTE,
@@ -114,7 +119,8 @@ typedef enum {
     EV_COMPACT,
     EV_COMPACT_EVACUATE,
     EV_COMPACT_FORWARD,
-    EV_COMPACT_RELEASE
+    EV_COMPACT_RELEASE,
+    EV_EMPTY_MINOR
 } ev_runtime_phase;
 
 typedef enum {
@@ -122,19 +128,32 @@ typedef enum {
     EV_C_FORCE_MINOR_MAKE_VECT,
     EV_C_FORCE_MINOR_SET_MINOR_HEAP_SIZE,
     EV_C_FORCE_MINOR_MEMPROF,
+
     EV_C_MINOR_PROMOTED,
     EV_C_MINOR_ALLOCATED,
+
     EV_C_REQUEST_MAJOR_ALLOC_SHR,
     EV_C_REQUEST_MAJOR_ADJUST_GC_SPEED,
     EV_C_REQUEST_MINOR_REALLOC_REF_TABLE,
     EV_C_REQUEST_MINOR_REALLOC_EPHE_REF_TABLE,
     EV_C_REQUEST_MINOR_REALLOC_CUSTOM_TABLE,
+
     EV_C_MAJOR_HEAP_POOL_WORDS,
     EV_C_MAJOR_HEAP_POOL_LIVE_WORDS,
     EV_C_MAJOR_HEAP_LARGE_WORDS,
     EV_C_MAJOR_HEAP_POOL_FRAG_WORDS,
     EV_C_MAJOR_HEAP_POOL_LIVE_BLOCKS,
     EV_C_MAJOR_HEAP_LARGE_BLOCKS,
+
+    EV_C_MAJOR_HEAP_WORDS,
+    EV_C_MAJOR_ALLOCATED_WORDS,
+    EV_C_MAJOR_ALLOCATED_WORK,
+    EV_C_MAJOR_DEPENDENT_WORK,
+    EV_C_MAJOR_EXTRA_WORK,
+    EV_C_MAJOR_WORK_COUNTER,
+    EV_C_MAJOR_ALLOC_COUNTER,
+    EV_C_MAJOR_SLICE_TARGET,
+    EV_C_MAJOR_SLICE_BUDGET
 } ev_runtime_counter;
 
 typedef enum {
@@ -157,6 +176,10 @@ typedef enum {
   E_CURSOR_POLL_BUSY = -8,
 } runtime_events_error;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Starts runtime_events. Needs to be called before
    [caml_runtime_events_create_cursor]. Needs the runtime lock held to call and
    will trigger a stop-the-world pause. */
@@ -173,6 +196,14 @@ CAMLextern void caml_runtime_events_pause(void);
    all other domains soon. Needs the runtime lock held to call as a resume event
    is written during this call. */
 CAMLextern void caml_runtime_events_resume(void);
+
+/* Returns [1] if runtime events are currently active (started and not paused),
+   [0] otherwise. */
+CAMLextern int caml_runtime_events_are_active(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #ifdef CAML_INTERNALS
 
@@ -272,8 +303,10 @@ void caml_runtime_events_destroy(void);
    in a forked child */
 CAMLextern void caml_runtime_events_post_fork(void);
 
-/* Returns the location of the runtime_events for the current process if started
-   or NULL otherwise */
+/* Return the path of the ring buffers file of this process, or NULL
+   if runtime events are not enabled. This is used in the consumer to
+   read the ring buffers of the current process. Always returns a
+   freshly-allocated string. */
 CAMLextern char_os* caml_runtime_events_current_location(void);
 
 /* Functions for putting runtime data on to the runtime_events. These are all
@@ -302,7 +335,9 @@ CAMLextern value caml_runtime_events_user_register(value event_name,
 /* Write event data to ring buffer. Should not be called when the runtime lock
    is not held, i.e., after [caml_enter_blocking_section()] and before
    [caml_leave_blocking_section()]. */
-CAMLextern value caml_runtime_events_user_write(value event,
+CAMLextern value caml_runtime_events_user_write(
+   value buf,
+   value event,
    value event_content);
 
 /* Resolve an event name to the associated event value using known registered
@@ -312,4 +347,4 @@ CAMLextern value caml_runtime_events_user_resolve(char* event_name,
 
 #endif /* CAML_INTERNALS */
 
-#endif /*CAML_RUNTIME_EVENTS_H*/
+#endif /* CAML_RUNTIME_EVENTS_H */

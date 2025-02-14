@@ -16,7 +16,7 @@
 (** The functions to get a string from different kinds of elements (types, modules, ...). *)
 
 module Name = Odoc_name
-let () = Printtyp.Naming_context.enable false
+let () = Out_type.Ident_names.enable false
 
 let string_of_variance t v =
   if ( t.Odoc_type.ty_kind = Odoc_type.Type_abstract ||
@@ -136,7 +136,7 @@ let string_of_class_params c =
           (
            match label with
              Asttypes.Nolabel -> ""
-           | s -> Printtyp.string_of_label s ^":"
+           | s -> Asttypes.string_of_label s ^":"
           )
           (if parent then "(" else "")
           (Odoc_print.string_of_type_expr

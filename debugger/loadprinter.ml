@@ -92,7 +92,7 @@ let eval_value_path env path =
 (* Install, remove a printer (as in toplevel/topdirs) *)
 
 let match_printer_type desc make_printer_type =
-  Ctype.with_local_level ~post:Ctype.generalize begin fun () ->
+  Ctype.with_local_level_generalize begin fun () ->
     let ty_arg = Ctype.newvar() in
     Ctype.unify Env.empty
       (make_printer_type ty_arg)
@@ -140,6 +140,8 @@ let remove_printer lid =
 
 open Format
 module Style = Misc.Style
+let quoted_longident =
+  Format_doc.compat @@ Style.as_inline_code Printtyp.Doc.longident
 
 let report_error ppf = function
   | Load_failure e ->
@@ -147,15 +149,15 @@ let report_error ppf = function
         (Dynlink.error_message e)
   | Unbound_identifier lid ->
       fprintf ppf "@[Unbound identifier %a@]@."
-      (Style.as_inline_code Printtyp.longident) lid
+        quoted_longident lid
   | Unavailable_module(md, lid) ->
       fprintf ppf
         "@[The debugger does not contain the code for@ %a.@ \
-           Please load an implementation of %s first.@]@."
-        (Style.as_inline_code Printtyp.longident) lid md
+         Please load an implementation of %s first.@]@."
+        quoted_longident lid md
   | Wrong_type lid ->
       fprintf ppf "@[%a has the wrong type for a printing function.@]@."
-      (Style.as_inline_code Printtyp.longident) lid
+        quoted_longident lid
   | No_active_printer lid ->
       fprintf ppf "@[%a is not currently active as a printing function.@]@."
-      (Style.as_inline_code Printtyp.longident) lid
+        quoted_longident lid

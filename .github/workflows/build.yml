@@ -11,11 +11,13 @@ on:
 # Restrict the GITHUB_TOKEN
 permissions: {}
 
-# List of test directories for the debug-s4096 and linux-O0 jobs.
-# These directories are selected because of their tendencies to reach corner
-# cases in the runtime system.
 env:
+  # List of test directories for the debug-s4096 and linux-O0 jobs. These
+  # directories are selected because of their tendencies to reach corner cases
+  # in the runtime system.
   PARALLEL_TESTS: parallel callback gc-roots weak-ephe-final
+  # Fully print commands executed by Make
+  # MAKEFLAGS: V=1
 
 # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#concurrency
 # Concurrent workflows are grouped by the PR or branch that triggered them
@@ -32,12 +34,12 @@ jobs:
 # We then upload the compiler tree as a build artifact to enable re-use in
 # subsequent jobs.
   build:
-    runs-on: 'ubuntu-latest'
+    runs-on: 'ubuntu-24.04'
     outputs:
       manual_changed: ${{ steps.manual.outputs.manual_changed }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
       - name: Check for manual changes
@@ -57,14 +59,14 @@ jobs:
          '${{ github.event.repository.full_name }}'
       - name: Configure tree
         run: |
-          MAKE_ARG=-j CONFIG_ARG='--enable-flambda --enable-cmm-invariants --enable-dependency-generation --enable-native-toplevel' OCAMLRUNPARAM=b,v=0 bash -xe tools/ci/actions/runner.sh configure
+          MAKE_ARG=-j CONFIG_ARG='--enable-flambda --enable-cmm-invariants --enable-codegen-invariants --enable-dependency-generation --enable-native-toplevel' OCAMLRUNPARAM=b,v=0 bash -xe tools/ci/actions/runner.sh configure
       - name: Build
         run: |
           MAKE_ARG=-j bash -xe tools/ci/actions/runner.sh build
       - name: Prepare Artifact
         run: tar --zstd -cf /tmp/sources.tar.zstd .
       - name: Upload Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: compiler
           path: /tmp/sources.tar.zstd
@@ -79,20 +81,20 @@ jobs:
   normal:
     name: ${{ matrix.name }}
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
           - id: normal
             name: normal
-            dependencies: texlive-latex-extra texlive-fonts-recommended hevea sass
+            dependencies: texlive-latex-extra texlive-fonts-recommended texlive-luatex hevea sass gdb lldb
           - id: debug
             name: extra (debug)
           - id: debug-s4096
             name: extra (debug-s4096)
     steps:
       - name: Download Artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: compiler
       - name: Unpack Artifact
@@ -150,19 +152,45 @@ jobs:
           - name: linux-O0
             os: ubuntu-latest
             config_arg: CFLAGS='-O0'
-          - name: macos
-            os: macos-latest
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: macos-x86_64
+            os: macos-13
+          - name: macos-arm64
+            os: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: OS Dependencies
-        if: runner.os == 'MacOS'
-        run: brew install parallel
+
+      - name: MacOS 13 Dependencies
+        if: matrix.os == 'macos-13'
+        run: |
+          brew install parallel
+          # Allows starting up lldb from a remote terminal
+          sudo DevToolsSecurity --enable
+          spctl developer-mode enable-terminal
+          # Select latest supported version
+          sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
+          lldb --version
+
+      - name: MacOS 14 Dependencies
+        if: matrix.os == 'macos-14'
+        run: |
+          brew install parallel
+          # Allows starting up lldb from a remote terminal
+          #   Note: in order to start lldb, the user must also be in
+          #   one of these groups: "admin" or "_developer".
+          sudo DevToolsSecurity --enable
+          spctl developer-mode enable-terminal
+          # Select latest supported version
+          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          lldb --version
+
       - name: configure tree
         run: |
-          CONFIG_ARG='${{ matrix.config_arg }}' MAKE_ARG=-j bash -xe tools/ci/actions/runner.sh configure
+          CONFIG_ARG='--enable-codegen-invariants ${{ matrix.config_arg }}' MAKE_ARG=-j bash -xe tools/ci/actions/runner.sh configure
       - name: Build
         run: |
           MAKE_ARG=-j bash -xe tools/ci/actions/runner.sh build
@@ -190,15 +218,17 @@ jobs:
         run: |
           apt-get update
           apt-get install -y git gcc make parallel
+          adduser --disabled-password --gecos '' ocaml
       - name: Checkout
         # See https://github.com/actions/checkout/issues/334
         uses: actions/checkout@v1
       - name: configure tree
         run: |
-          MAKE_ARG=-j bash -xe tools/ci/actions/runner.sh configure
+          chown -R ocaml:ocaml .
+          MAKE_ARG=-j su ocaml -c "bash -xe tools/ci/actions/runner.sh configure"
       - name: Build
         run: |
-          MAKE_ARG=-j bash -xe tools/ci/actions/runner.sh build
+          MAKE_ARG=-j su ocaml -c "bash -xe tools/ci/actions/runner.sh build"
       - name: Run the testsuite
         run: |
-          bash -xe tools/ci/actions/runner.sh test
+          su ocaml -c "bash -xe tools/ci/actions/runner.sh test"

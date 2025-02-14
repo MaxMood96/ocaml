@@ -25,13 +25,13 @@ end
 [%%expect{|
 {
  "Pair"[module] ->
-   Abs<.9>(X/282, Y/283, {
-                          "t"[type] -> <.5>;
-                          "to_string"[value] -> <.6>;
-                          });
+   Abs<.9>(X, Y, {
+                  "t"[type] -> <.5>;
+                  "to_string"[value] -> <.6>;
+                  });
  }
 module Pair :
-  functor (X : Stringable) (Y : Stringable) ->
+  (X : Stringable) (Y : Stringable) ->
     sig type t = X.t * Y.t val to_string : X.t * Y.t -> string end
 |}]
 
@@ -80,7 +80,6 @@ module P :
 
 P.to_string (0, ("!=", 1))
 [%%expect{|
-{
- }
+{}
 - : string = "0 != 1"
 |}]

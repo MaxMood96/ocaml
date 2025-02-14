@@ -13,6 +13,7 @@
 /*   special exception on linking described in the file LICENSE.          */
 /*                                                                        */
 /**************************************************************************/
+
 #ifndef CAML_SHARED_HEAP_H
 #define CAML_SHARED_HEAP_H
 
@@ -88,6 +89,10 @@ Caml_inline int is_marked(value v) {
   return Has_status_val(v, caml_global_heap_state.MARKED);
 }
 
+Caml_inline int is_not_markable(value v) {
+  return Has_status_val(v, NOT_MARKABLE);
+}
+
 void caml_redarken_pool(struct pool*, scanning_action, void*);
 
 intnat caml_sweep(struct caml_heap_state*, intnat);
@@ -100,6 +105,15 @@ void caml_cycle_heap(struct caml_heap_state*);
 
 /* Heap invariant verification (for debugging) */
 void caml_verify_heap_from_stw(caml_domain_state *domain);
+
+/* Forces finalisation of all heap-allocated values,
+   disregarding both local and global roots.
+
+   Warning: this function should only be used on runtime shutdown.
+*/
+void caml_finalise_heap(void);
+
+void caml_finalise_freelist(void);
 
 #ifdef DEBUG
 /* [is_garbage(v)] returns true if [v] is a garbage value */

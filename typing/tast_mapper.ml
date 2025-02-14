@@ -279,8 +279,9 @@ let pat
     match x.pat_desc with
     | Tpat_any
     | Tpat_constant _ -> x.pat_desc
-    | Tpat_var (id, s) -> Tpat_var (id, map_loc sub s)
-    | Tpat_tuple l -> Tpat_tuple (List.map (sub.pat sub) l)
+    | Tpat_var (id, s, uid) -> Tpat_var (id, map_loc sub s, uid)
+    | Tpat_tuple l ->
+        Tpat_tuple (List.map (fun (label, p) -> label, sub.pat sub p) l)
     | Tpat_construct (loc, cd, l, vto) ->
         let vto = Option.map (fun (vl,cty) ->
           List.map (map_loc sub) vl, sub.typ sub cty) vto in
@@ -289,8 +290,9 @@ let pat
         Tpat_variant (l, Option.map (sub.pat sub) po, rd)
     | Tpat_record (l, closed) ->
         Tpat_record (List.map (tuple3 (map_loc sub) id (sub.pat sub)) l, closed)
-    | Tpat_array l -> Tpat_array (List.map (sub.pat sub) l)
-    | Tpat_alias (p, id, s) -> Tpat_alias (sub.pat sub p, id, map_loc sub s)
+    | Tpat_array (mut, l) -> Tpat_array (mut, List.map (sub.pat sub) l)
+    | Tpat_alias (p, id, s, uid, ty) ->
+        Tpat_alias (sub.pat sub p, id, map_loc sub s, uid, ty)
     | Tpat_lazy p -> Tpat_lazy (sub.pat sub p)
     | Tpat_value p ->
        (as_computation_pattern (sub.pat sub (p :> pattern))).pat_desc
@@ -359,21 +361,23 @@ let expr sub x =
     | Texp_apply (exp, list) ->
         Texp_apply (
           sub.expr sub exp,
-          List.map (tuple2 id (Option.map (sub.expr sub))) list
+          List.map (tuple2 id (Typedtree.map_apply_arg (sub.expr sub))) list
         )
-    | Texp_match (exp, cases, p) ->
+    | Texp_match (exp, cases, eff_cases, p) ->
         Texp_match (
           sub.expr sub exp,
           List.map (sub.case sub) cases,
+          List.map (sub.case sub) eff_cases,
           p
         )
-    | Texp_try (exp, cases) ->
+    | Texp_try (exp, exn_cases, eff_cases) ->
         Texp_try (
           sub.expr sub exp,
-          List.map (sub.case sub) cases
+          List.map (sub.case sub) exn_cases,
+          List.map (sub.case sub) eff_cases
         )
     | Texp_tuple list ->
-        Texp_tuple (List.map (sub.expr sub) list)
+        Texp_tuple (List.map (fun (label, e) -> label, sub.expr sub e) list)
     | Texp_construct (lid, cd, args) ->
         Texp_construct (map_loc sub lid, cd, List.map (sub.expr sub) args)
     | Texp_variant (l, expo) ->
@@ -398,8 +402,8 @@ let expr sub x =
           ld,
           sub.expr sub exp2
         )
-    | Texp_array list ->
-        Texp_array (List.map (sub.expr sub) list)
+    | Texp_array (mut, list) ->
+        Texp_array (mut, List.map (sub.expr sub) list)
     | Texp_ifthenelse (exp1, exp2, expo) ->
         Texp_ifthenelse (
           sub.expr sub exp1,
@@ -684,7 +688,7 @@ let class_expr sub x =
     | Tcl_apply (cl, args) ->
         Tcl_apply (
           sub.class_expr sub cl,
-          List.map (tuple2 id (Option.map (sub.expr sub))) args
+          List.map (tuple2 id (Typedtree.map_apply_arg (sub.expr sub))) args
         )
     | Tcl_let (rec_flag, value_bindings, ivars, cl) ->
         let (rec_flag, value_bindings) =
@@ -760,7 +764,8 @@ let typ sub x =
     | Ttyp_var _ as d -> d
     | Ttyp_arrow (label, ct1, ct2) ->
         Ttyp_arrow (label, sub.typ sub ct1, sub.typ sub ct2)
-    | Ttyp_tuple list -> Ttyp_tuple (List.map (sub.typ sub) list)
+    | Ttyp_tuple list ->
+        Ttyp_tuple (List.map (fun (label, t) -> label, sub.typ sub t) list)
     | Ttyp_constr (path, lid, list) ->
         Ttyp_constr (path, map_loc sub lid, List.map (sub.typ sub) list)
     | Ttyp_object (list, closed) ->
@@ -842,11 +847,12 @@ let value_bindings sub (rec_flag, list) =
 
 let case
   : type k . mapper -> k case -> k case
-  = fun sub {c_lhs; c_guard; c_rhs} ->
+  = fun sub {c_lhs; c_guard; c_rhs; c_cont} ->
   {
     c_lhs = sub.pat sub c_lhs;
     c_guard = Option.map (sub.expr sub) c_guard;
     c_rhs = sub.expr sub c_rhs;
+    c_cont
   }
 
 let value_binding sub x =

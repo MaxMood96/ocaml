@@ -28,9 +28,9 @@
 #include "caml/signals.h"
 #include "caml/memprof.h"
 
-uintnat caml_custom_major_ratio = Custom_major_ratio_def;
-uintnat caml_custom_minor_ratio = Custom_minor_ratio_def;
-uintnat caml_custom_minor_max_bsz = Custom_minor_max_bsz_def;
+_Atomic uintnat caml_custom_major_ratio = Custom_major_ratio_def;
+_Atomic uintnat caml_custom_minor_ratio = Custom_minor_ratio_def;
+_Atomic uintnat caml_custom_minor_max_bsz = Custom_minor_max_bsz_def;
 
 mlsize_t caml_custom_get_max_major (void)
 {
@@ -45,7 +45,7 @@ mlsize_t caml_custom_get_max_major (void)
      allocated during the previous cycle.  [heap_size / 150] is really
      [heap_size * (2/3) / 100] (but faster). */
   return caml_heap_size(Caml_state->shared_heap) / 150
-         * caml_custom_major_ratio;
+         * atomic_load_relaxed(&caml_custom_major_ratio);
 }
 
 /* [mem] is an amount of out-of-heap resources, in the same units as
@@ -70,7 +70,8 @@ static value alloc_custom_gen (const struct custom_operations * ops,
   CAMLlocal1(result);
 
   wosize = 1 + (bsz + sizeof(value) - 1) / sizeof(value);
-  if (wosize <= Max_young_wosize && mem <= caml_custom_minor_max_bsz) {
+  if (wosize <= Max_young_wosize
+      && mem <= atomic_load_relaxed(&caml_custom_minor_max_bsz)) {
     result = caml_alloc_small(wosize, Custom_tag);
     Custom_ops_val(result) = ops;
     if (ops->finalize != NULL || mem != 0) {
@@ -95,7 +96,8 @@ static value alloc_custom_gen (const struct custom_operations * ops,
 Caml_inline mlsize_t get_max_minor (void)
 {
   return
-    Bsize_wsize (Caml_state->minor_heap_wsz) / 100 * caml_custom_minor_ratio;
+    Bsize_wsize (Caml_state->minor_heap_wsz) / 100
+                * atomic_load_relaxed(&caml_custom_minor_ratio);
 }
 
 CAMLexport value caml_alloc_custom(const struct custom_operations * ops,
@@ -112,7 +114,10 @@ CAMLexport value caml_alloc_custom_mem(const struct custom_operations * ops,
                                        uintnat bsz,
                                        mlsize_t mem)
 {
-  return alloc_custom_gen (ops, bsz, mem, 0, get_max_minor());
+  value v = alloc_custom_gen (ops, bsz, mem, 0, get_max_minor());
+  size_t mem_words = (mem + sizeof(value) - 1) / sizeof(value);
+  caml_memprof_sample_block(v, mem_words, mem_words, CAML_MEMPROF_SRC_CUSTOM);
+  return v;
 }
 
 struct custom_operations_list {
@@ -148,8 +153,9 @@ caml_register_custom_operations(const struct custom_operations * ops)
 
 struct custom_operations * caml_find_custom_operations(const char * ident)
 {
-  struct custom_operations_list * l;
-  for (l = atomic_load(&custom_ops_table); l != NULL; l = l->next)
+  for (struct custom_operations_list *l = atomic_load(&custom_ops_table);
+       l != NULL;
+       l = l->next)
     if (strcmp(l->ops->identifier, ident) == 0)
       return (struct custom_operations*)l->ops;
   return NULL;
@@ -159,9 +165,10 @@ static custom_operations_table custom_ops_final_table = NULL;
 
 struct custom_operations * caml_final_custom_operations(final_fun fn)
 {
-  struct custom_operations_list * l;
   struct custom_operations * ops;
-  for (l = atomic_load(&custom_ops_final_table); l != NULL; l = l->next)
+  for (struct custom_operations_list *l = atomic_load(&custom_ops_final_table);
+       l != NULL;
+       l = l->next)
     if (l->ops->finalize == fn) return (struct custom_operations*)l->ops;
   ops = caml_stat_alloc(sizeof(struct custom_operations));
   ops->identifier = "_final";

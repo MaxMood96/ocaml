@@ -38,6 +38,8 @@ _ocamltestd
 .merlin
 _build
 META
+# Ignore foo.depend, but not .depend
+?*.depend
 
 # local to root directory
 
@@ -74,7 +76,7 @@ META
 /asmcomp/stackframe.ml
 
 /boot/ocamlrun
-/boot/camlheader
+/boot/runtime-launch-info
 /boot/ocamlc.opt
 
 /byte/**
@@ -92,6 +94,7 @@ META
 /emacs/*.elc
 
 /flexdll-sources
+/winpthreads-sources
 
 /lambda/runtimedef.ml
 
@@ -209,13 +212,12 @@ META
 /opt/**
 
 /otherlibs/*/.dep
+/otherlibs/dynlink/dynlink_config.ml
+/otherlibs/dynlink/dynlink_cmo_format.mli
+/otherlibs/dynlink/dynlink_cmxs_format.mli
 /otherlibs/dynlink/dynlink_platform_intf.mli
 /otherlibs/dynlink/byte/dynlink.mli
 /otherlibs/dynlink/native/dynlink.mli
-/otherlibs/dynlink/dynlink_compilerlibs/Makefile
-/otherlibs/dynlink/dynlink_compilerlibs/*.ml
-/otherlibs/dynlink/dynlink_compilerlibs/*.mli
-/otherlibs/dynlink/dynlink_compilerlibs/.depend
 /otherlibs/unix/unix.ml
 
 /parsing/parser.ml
@@ -249,14 +251,13 @@ META
 /runtime/build_config.h
 /runtime/sak
 
-/stdlib/camlheader
-/stdlib/target_camlheader
-/stdlib/camlheader[di]
-/stdlib/target_camlheader[di]
-/stdlib/camlheader_ur
+/stdlib/runtime.info
+/stdlib/runtime-launch-info
 /stdlib/labelled-*
 /stdlib/caml
 /stdlib/sys.ml
+/stdlib/target_runtime.info
+/stdlib/target_runtime-launch-info
 
 /testsuite/**/*.result
 /testsuite/**/*.opt_result
@@ -309,6 +310,7 @@ META
 /tools/ocamltex
 /tools/eventlog_metadata
 /tools/lintapidiff.opt
+/tools/sync_dynlink.opt
 
 /toplevel/byte/topeval.mli
 /toplevel/byte/trace.mli

@@ -427,7 +427,7 @@ let sort_files_by_dependencies files =
 
 (* Init Hashtbl with all defined modules *)
   let files = List.map (fun (file, file_kind, deps, pp_deps) ->
-    let modname = Unit_info.modname_from_source file in
+    let modname = Unit_info.lax_modname_from_source file in
     let key = (modname, file_kind) in
     let new_deps = ref [] in
     Hashtbl.add h key (file, new_deps);
@@ -526,7 +526,7 @@ let parse_map fname =
       ~mli_file:process_mli_map
   in
   Clflags.transparent_modules := old_transp;
-  let modname = Unit_info.modname_from_source fname in
+  let modname = Unit_info.lax_modname_from_source fname in
   if String.Map.is_empty m then
     report_err (Failure (fname ^ " : empty map file or parse error"));
   let mm = Depend.make_node m in
@@ -594,6 +594,9 @@ let run_main argv =
         "<f>  Process <f> as a .ml file";
       "-intf", Arg.String (add_dep_arg (fun f -> Src (f, Some MLI))),
         "<f>  Process <f> as a .mli file";
+      "-keywords", Arg.String (fun s -> Clflags.keyword_edition := Some s ),
+      "<version+list>  set keywords following the <version+list> spec \
+       (see ocamlc)";
       "-map", Arg.String (add_dep_arg (fun f -> Map f)),
         "<f>  Read <f> and propagate delayed dependencies to following files";
       "-ml-synonym", Arg.String(add_to_synonym_list ml_synonyms),

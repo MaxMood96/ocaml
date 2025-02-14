@@ -116,10 +116,7 @@ let for_primitive (prim : Clambda_primitives.primitive) =
   | Psetfield _
   | Psetfield_computed _
   | Psetfloatfield _
-  | Patomic_load _
-  | Patomic_exchange
-  | Patomic_cas
-  | Patomic_fetch_add
+  | Patomic_load
   | Parraysetu _
   | Parraysets _
   | Pbytessetu
@@ -133,7 +130,7 @@ let for_primitive (prim : Clambda_primitives.primitive) =
   | Pbswap16
   | Pbbswap _ -> No_effects, No_coeffects
   | Pint_as_pointer -> No_effects, No_coeffects
-  | Popaque -> Arbitrary_effects, Has_coeffects
+  | Popaque | Ppoll -> Arbitrary_effects, Has_coeffects
   | Psequand
   | Psequor ->
       (* Removed by [Closure_conversion] in the flambda pipeline. *)

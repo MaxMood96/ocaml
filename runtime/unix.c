@@ -27,13 +27,12 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
+#include "caml/config.h"
 #ifdef HAS_GETTIMEOFDAY
 #include <sys/time.h>
 #endif
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <errno.h>
-#include "caml/config.h"
 #if defined(SUPPORT_DYNAMIC_LINKING) && !defined(BUILDING_LIBCAMLRUNS)
 #define WITH_DYNAMIC_LINKING
 #ifdef __CYGWIN__
@@ -42,12 +41,12 @@
 #include <dlfcn.h>
 #endif
 #endif
-#ifdef HAS_UNISTD
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 #ifdef HAS_POSIX_MONOTONIC_CLOCK
 #include <time.h>
-#elif HAS_CLOCK_GETTIME_NSEC_NP
+#elif defined(HAS_CLOCK_GETTIME_NSEC_NP)
 #include <time.h>
 #endif
 #ifdef HAS_DIRENT
@@ -136,15 +135,14 @@ caml_stat_string caml_decompose_path(struct ext_table * tbl, char * path)
 
 caml_stat_string caml_search_in_path(struct ext_table * path, const char * name)
 {
-  const char * p;
-  char * dir, * fullname;
-  int i;
+  const char * dir;
+  char * fullname;
   struct stat st;
 
-  for (p = name; *p != 0; p++) {
+  for (const char *p = name; *p != 0; p++) {
     if (*p == '/') goto not_found;
   }
-  for (i = 0; i < path->size; i++) {
+  for (int i = 0; i < path->size; i++) {
     dir = path->contents[i];
     if (dir[0] == 0) dir = ".";  /* empty path component = current dir */
     fullname = caml_stat_strconcat(3, dir, "/", name);
@@ -176,14 +174,11 @@ static int cygwin_file_exists(const char * name)
 static caml_stat_string cygwin_search_exe_in_path(struct ext_table * path,
                                                   const char * name)
 {
-  const char * p;
   char * dir, * fullname;
-  int i;
-
-  for (p = name; *p != 0; p++) {
+  for (const char *p = name; *p != 0; p++) {
     if (*p == '/' || *p == '\\') goto not_found;
   }
-  for (i = 0; i < path->size; i++) {
+  for (int i = 0; i < path->size; i++) {
     dir = path->contents[i];
     if (dir[0] == 0) dir = ".";  /* empty path component = current dir */
     fullname = caml_stat_strconcat(3, dir, "/", name);
@@ -339,9 +334,9 @@ CAMLexport int caml_read_directory(char * dirname, struct ext_table * contents)
 {
   DIR * d;
 #ifdef HAS_DIRENT
-  struct dirent * e;
+  const struct dirent * e;
 #else
-  struct direct * e;
+  const struct direct * e;
 #endif
 
   d = opendir(dirname);
@@ -435,14 +430,14 @@ uint64_t caml_time_counter(void)
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   return
-    (uint64_t)t.tv_sec  * (uint64_t)1000000000 +
-    (uint64_t)t.tv_nsec;
+    (uint64_t) t.tv_sec  * NSEC_PER_SEC +
+    (uint64_t) t.tv_nsec;
 #elif defined(HAS_GETTIMEOFDAY)
   struct timeval t;
   gettimeofday(&t, 0);
   return
-    (uint64_t)t.tv_sec  * (uint64_t)1000000000 +
-    (uint64_t)t.tv_usec * (uint64_t)1000;
+    (uint64_t) t.tv_sec  * NSEC_PER_SEC +
+    (uint64_t) t.tv_usec * NSEC_PER_USEC;
 #else
 # error "No timesource available"
 #endif

@@ -12,6 +12,9 @@
 (*                                                                        *)
 (**************************************************************************)
 
+external runtime_events_are_active : unit -> bool
+  = "caml_ml_runtime_events_are_active" [@@noalloc]
+
 type runtime_counter =
 | EV_C_FORCE_MINOR_ALLOC_SMALL
 | EV_C_FORCE_MINOR_MAKE_VECT
@@ -30,6 +33,15 @@ type runtime_counter =
 | EV_C_MAJOR_HEAP_POOL_FRAG_WORDS
 | EV_C_MAJOR_HEAP_POOL_LIVE_BLOCKS
 | EV_C_MAJOR_HEAP_LARGE_BLOCKS
+| EV_C_MAJOR_HEAP_WORDS
+| EV_C_MAJOR_ALLOCATED_WORDS
+| EV_C_MAJOR_ALLOCATED_WORK
+| EV_C_MAJOR_DEPENDENT_WORK
+| EV_C_MAJOR_EXTRA_WORK
+| EV_C_MAJOR_WORK_COUNTER
+| EV_C_MAJOR_ALLOC_COUNTER
+| EV_C_MAJOR_SLICE_TARGET
+| EV_C_MAJOR_SLICE_BUDGET
 
 type runtime_phase =
 | EV_EXPLICIT_GC_SET
@@ -41,9 +53,12 @@ type runtime_phase =
 | EV_MAJOR
 | EV_MAJOR_SWEEP
 | EV_MAJOR_MARK_ROOTS
+| EV_MAJOR_MEMPROF_ROOTS
 | EV_MAJOR_MARK
 | EV_MINOR
 | EV_MINOR_LOCAL_ROOTS
+| EV_MINOR_MEMPROF_ROOTS
+| EV_MINOR_MEMPROF_CLEAN
 | EV_MINOR_FINALIZED
 | EV_EXPLICIT_GC_MAJOR_SLICE
 | EV_FINALISE_UPDATE_FIRST
@@ -66,6 +81,7 @@ type runtime_phase =
 | EV_STW_HANDLER
 | EV_STW_LEADER
 | EV_MAJOR_FINISH_SWEEPING
+| EV_MAJOR_MEMPROF_CLEAN
 | EV_MINOR_FINALIZERS_ADMIN
 | EV_MINOR_REMEMBERED_SET
 | EV_MINOR_REMEMBERED_SET_PROMOTE
@@ -76,6 +92,7 @@ type runtime_phase =
 | EV_COMPACT_EVACUATE
 | EV_COMPACT_FORWARD
 | EV_COMPACT_RELEASE
+| EV_EMPTY_MINOR
 
 type lifecycle =
   EV_RING_START
@@ -114,6 +131,25 @@ let runtime_counter_name counter =
       "major_heap_pool_live_blocks"
   | EV_C_MAJOR_HEAP_LARGE_BLOCKS ->
       "major_heap_large_blocks"
+  | EV_C_MAJOR_HEAP_WORDS ->
+      "major_heap_words"
+  | EV_C_MAJOR_ALLOCATED_WORDS ->
+      "major_allocated_words"
+  | EV_C_MAJOR_ALLOCATED_WORK ->
+      "major_allocated_work"
+  | EV_C_MAJOR_DEPENDENT_WORK ->
+      "major_dependent_work"
+  | EV_C_MAJOR_EXTRA_WORK ->
+      "major_extra_work"
+  | EV_C_MAJOR_WORK_COUNTER ->
+      "major_work_counter"
+  | EV_C_MAJOR_ALLOC_COUNTER ->
+      "major_alloc_counter"
+  | EV_C_MAJOR_SLICE_TARGET ->
+      "major_slice_target"
+  | EV_C_MAJOR_SLICE_BUDGET ->
+      "major_slice_budget"
+
 
 let runtime_phase_name phase =
   match phase with
@@ -126,9 +162,12 @@ let runtime_phase_name phase =
   | EV_MAJOR -> "major"
     | EV_MAJOR_SWEEP -> "major_sweep"
   | EV_MAJOR_MARK_ROOTS -> "major_mark_roots"
+  | EV_MAJOR_MEMPROF_ROOTS -> "major_memprof_roots"
   | EV_MAJOR_MARK -> "major_mark"
   | EV_MINOR -> "minor"
   | EV_MINOR_LOCAL_ROOTS -> "minor_local_roots"
+  | EV_MINOR_MEMPROF_ROOTS -> "minor_memprof_roots"
+  | EV_MINOR_MEMPROF_CLEAN -> "minor_memprof_clean"
   | EV_MINOR_FINALIZED -> "minor_finalized"
   | EV_EXPLICIT_GC_MAJOR_SLICE -> "explicit_gc_major_slice"
   | EV_FINALISE_UPDATE_FIRST -> "finalise_update_first"
@@ -150,6 +189,7 @@ let runtime_phase_name phase =
   | EV_STW_HANDLER -> "stw_handler"
   | EV_STW_LEADER -> "stw_leader"
   | EV_MAJOR_FINISH_SWEEPING -> "major_finish_sweeping"
+  | EV_MAJOR_MEMPROF_CLEAN -> "major_memprof_clean"
   | EV_MINOR_FINALIZERS_ADMIN -> "minor_finalizers_admin"
   | EV_MINOR_REMEMBERED_SET -> "minor_remembered_set"
   | EV_MINOR_REMEMBERED_SET_PROMOTE -> "minor_remembered_set_promote"
@@ -161,6 +201,7 @@ let runtime_phase_name phase =
   | EV_COMPACT_EVACUATE -> "compaction_evacuate"
   | EV_COMPACT_FORWARD -> "compaction_forward"
   | EV_COMPACT_RELEASE -> "compaction_release"
+  | EV_EMPTY_MINOR -> "empty_minor"
 
 let lifecycle_name lifecycle =
   match lifecycle with
@@ -236,12 +277,66 @@ module User = struct
   }
 
   external user_register : string -> tag option -> 'a Type.t -> 'a t
-                         = "caml_runtime_events_user_register"
-  external user_write : 'a t -> 'a -> unit = "caml_runtime_events_user_write"
+    = "caml_runtime_events_user_register"
+  external user_write : bytes -> 'a t -> 'a -> unit
+    = "caml_runtime_events_user_write"
 
   let register name tag typ = user_register name (Some tag) typ
 
-  let write event value = user_write event value
+  let with_write_buffer =
+    (* [caml_runtime_events_user_write] needs a write buffer in which
+       the user-provided serializer will write its data. The user may
+       want to write a lot of custom events fast, so we want to cache
+       the write buffer across calls.
+
+       To be safe for multi-domain programs, we use domain-local
+       storage for the write buffer. To accommodate for multi-threaded
+       programs (without depending on the Thread module), we store
+       a list of caches for each domain. This might leak a bit of
+       memory: the number of buffers for a domain is equal to the
+       maximum number of threads that requested a buffer concurrently,
+       and we never free those buffers. *)
+    let create_buffer () = Bytes.create 1024 in
+    let write_buffer_cache = Domain.DLS.new_key (fun () -> ref []) in
+    let pop_or_create buffers =
+      (* intended to be thread-safe *)
+      (* begin atomic *)
+      match !buffers with
+      | [] ->
+          (* end atomic *)
+          create_buffer ()
+      | b::bs ->
+          buffers := bs;
+          (* end atomic *)
+          b
+    in
+    let[@poll error] compare_and_set r old_val new_val =
+      if !r == old_val then (r := new_val; true)
+      else false
+    in
+    let rec push buffers buf =
+      (* intended to be thread-safe *)
+      let old_buffers = !buffers in
+      let new_buffers = buf :: old_buffers in
+      (* retry if !buffers changed under our feet: *)
+      if compare_and_set buffers old_buffers new_buffers
+      then ()
+      else push buffers buf
+    in
+    fun consumer ->
+      let buffers = Domain.DLS.get write_buffer_cache in
+      let buf = pop_or_create buffers in
+      Fun.protect ~finally:(fun () -> push buffers buf)
+        (fun () -> consumer buf)
+
+  let write (type a) (event : a t) (value : a) =
+    if runtime_events_are_active () then
+    (* only custom events need a write buffer *)
+    match event.typ with
+    | Type.Custom _ ->
+        with_write_buffer (fun buf -> user_write buf event value)
+    | Type.Unit | Type.Int | Type.Span ->
+        user_write Bytes.empty event value
 
   let name ev = ev.name
 
@@ -308,6 +403,7 @@ end
 external start : unit -> unit = "caml_ml_runtime_events_start"
 external pause : unit -> unit = "caml_ml_runtime_events_pause"
 external resume : unit -> unit = "caml_ml_runtime_events_resume"
+external path : unit -> string option = "caml_ml_runtime_events_path"
 
 external create_cursor : (string * int) option -> cursor
                                         = "caml_ml_runtime_events_create_cursor"

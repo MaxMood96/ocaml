@@ -69,7 +69,7 @@ extern int caml_lf_skiplist_find(struct lf_skiplist *sk, uintnat key,
 extern int caml_lf_skiplist_find_below(struct lf_skiplist *sk, uintnat k,
                                        /*out*/ uintnat *key,
                                        /*out*/ uintnat *data);
-/* Insertion in a skip list. [key] must be between 1 and UINTNAT_MAX-1.
+/* Insertion in a skip list. [key] must be between 1 and CAML_UINTNAT_MAX-1.
    If [key] was already there, change the associated data and return 1.
    If [key] was not there, insert new [key, data] binding and return 0. */
 extern int caml_lf_skiplist_insert(struct lf_skiplist *sk, uintnat key,
@@ -100,7 +100,7 @@ extern void caml_lf_skiplist_free_garbage(struct lf_skiplist *sk);
    [var] designates the current element.
    [action] can refer to [var->key] and [var->data].
    [action] can safely remove the current element, i.e. call
-   [caml_skiplist_remove] on [var->key].  The traversal will
+   [caml_lf_skiplist_remove] on [var->key].  The traversal will
    continue with the skiplist element following the removed element.
    Other operations performed over the skiplist during its traversal have
    unspecified effects on the traversal. */

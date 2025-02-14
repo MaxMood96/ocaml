@@ -35,7 +35,10 @@ let emit_printf fmt =
 
 let emit_int32 n = emit_printf "0x%lx" n
 
+let macosx = Config.system = "macosx"
+
 let emit_symbol s =
+  if macosx then output_char !output_channel '_';
   for i = 0 to String.length s - 1 do
     let c = s.[i] in
     match c with
@@ -45,7 +48,7 @@ let emit_symbol s =
       if c = Compilenv.symbol_separator then
         output_char !output_channel c
       else
-        Printf.fprintf !output_channel "$%02x" (Char.code c)
+        Printf.fprintf !output_channel "$$%02x" (Char.code c)
   done
 
 let emit_string_literal s =
@@ -110,6 +113,29 @@ let emit_float64_split_directive directive x =
 
 let emit_float32_directive directive x =
   emit_printf "\t%s\t0x%lx\n" directive x
+
+let emit_size_directive symbol =
+  if Config.asm_size_type_directives then begin
+    emit_string "\t.size\t";
+    emit_symbol symbol;
+    emit_string ", . - ";
+    emit_symbol symbol;
+    emit_char '\n'
+  end
+
+let emit_type_directive symbol ty =
+  if Config.asm_size_type_directives then begin
+    emit_string "\t.type\t";
+    emit_symbol symbol;
+    emit_string ", ";
+    emit_string ty;
+    emit_char '\n'
+  end
+
+let emit_nonexecstack_note () =
+  if Config.with_nonexecstack_note then begin
+    emit_string "\t.section .note.GNU-stack,\"\",%progbits\n"
+  end
 
 (* Record live pointers at call points *)
 
@@ -457,9 +483,18 @@ let reset () =
 let binary_backend_available = ref false
 let create_asm_file = ref true
 
-let report_error ppf = function
+let report_error_doc ppf = function
   | Stack_frame_too_large n ->
-      Format.fprintf ppf "stack frame too large (%d bytes)" n
+      Format_doc.fprintf ppf "stack frame too large (%d bytes)" n
+
+let () =
+  Location.register_error_of_exn
+    (function
+      | Error err -> Some (Location.error_of_printer_file report_error_doc err)
+      | _ -> None
+    )
+
+let report_error = Format_doc.compat report_error_doc
 
 let mk_env f : Emitenv.per_function_env =
   {
@@ -474,3 +509,16 @@ let mk_env f : Emitenv.per_function_env =
     float_literals = [];
     int_literals = [];
   }
+
+let emit_named_text_section func_name prefix_char =
+  if !Clflags.function_sections then begin
+    emit_string "\t.section .text.caml.";
+    emit_symbol func_name;
+    emit_char ',';
+    emit_string_literal "ax";
+    emit_char ',';
+    emit_char prefix_char;
+    emit_string "progbits\n";
+  end
+  else
+    emit_string "\t.text\n"

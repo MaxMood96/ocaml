@@ -203,10 +203,11 @@ val mk_load_atomic : memory_chunk -> operation
     [n]th field of the block pointed to by [ptr] *)
 val field_address : expression -> int -> Debuginfo.t -> expression
 
-(** [get_field_gen mut ptr n dbg] returns an expression for the access to the
-    [n]th field of the block pointed to by [ptr] *)
+(** [get_field_gen ?memory_chunk mut ptr n dbg] returns an expression for
+    the access to the [n]th field of the block pointed to by [ptr]. *)
 val get_field_gen :
-  Asttypes.mutable_flag -> expression -> int -> Debuginfo.t -> expression
+  ?memory_chunk:memory_chunk -> Asttypes.mutable_flag -> expression -> int ->
+  Debuginfo.t -> expression
 
 (** [set_field ptr n newval init dbg] returns an expression for setting the
     [n]th field of the block pointed to by [ptr] to [newval] *)
@@ -538,10 +539,12 @@ val bigstring_set :
 (** [transl_isout h arg dbg] *)
 val transl_isout : expression -> expression -> Debuginfo.t -> expression
 
+type switch_arg = Tagged of expression | Untagged of expression
 (** [make_switch arg cases actions dbg] : Generate a Cswitch construct,
-    or optimize as a static table lookup when possible. *)
+    or optimize as a static table lookup when possible.
+*)
 val make_switch :
-  expression -> int array -> (expression * Debuginfo.t) array -> Debuginfo.t ->
+  switch_arg -> int array -> (expression * Debuginfo.t) array -> Debuginfo.t ->
   expression
 
 (** [transl_int_switch loc arg low high cases default] *)

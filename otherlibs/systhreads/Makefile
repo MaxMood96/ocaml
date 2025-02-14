@@ -18,11 +18,8 @@ ROOTDIR=../..
 include $(ROOTDIR)/Makefile.common
 include $(ROOTDIR)/Makefile.best_binaries
 
-ifneq "$(CCOMPTYPE)" "msvc"
-OC_CFLAGS += -g
-endif
-
-OC_CFLAGS += $(SHAREDLIB_CFLAGS)
+OC_BYTECODE_CFLAGS += $(SHAREDLIB_CFLAGS)
+OC_NATIVE_CFLAGS += $(SHAREDLIB_CFLAGS)
 
 LIBS = $(STDLIBFLAGS) -I $(ROOTDIR)/otherlibs/unix
 
@@ -58,33 +55,22 @@ all: lib$(LIBNAME).$(A) $(LIBNAME).cma $(CMIFILES)
 
 allopt: lib$(LIBNAME)nat.$(A) $(LIBNAME).cmxa $(CMIFILES)
 
+lib$(LIBNAME).$(A): OC_CFLAGS = $(OC_BYTECODE_CFLAGS)
+
 lib$(LIBNAME).$(A): $(BYTECODE_C_OBJS)
 	$(V_OCAMLMKLIB)$(MKLIB) -o $(LIBNAME) $(BYTECODE_C_OBJS)
 
-lib$(LIBNAME)nat.$(A): OC_CFLAGS += $(OC_NATIVE_CFLAGS)
+lib$(LIBNAME)nat.$(A): OC_CFLAGS = $(OC_NATIVE_CFLAGS)
 
 lib$(LIBNAME)nat.$(A): $(NATIVECODE_C_OBJS)
 	$(V_OCAMLMKLIB)$(MKLIB) -o $(LIBNAME)nat $^
 
 $(LIBNAME).cma: $(THREADS_BCOBJS)
-ifeq "$(UNIX_OR_WIN32)" "unix"
-	$(V_OCAMLMKLIB)$(MKLIB) -o $(LIBNAME) -ocamlc '$(CAMLC)' -cclib -lunixbyt -linkall $^
-# TODO: Figure out why -cclib -lunix is used here.
-# It may be because of the threadsUnix module which is deprecated.
-# It may hence be good to figure out whether this module shouldn't be
-# removed, and then -cclib -lunix arguments.
-else # Windows
-	$(V_OCAMLMKLIB)$(MKLIB) -o $(LIBNAME) -ocamlc "$(CAMLC)" -linkall $^
-endif
+	$(V_OCAMLMKLIB)$(MKLIB) -o $(LIBNAME) -ocamlc '$(CAMLC)' -linkall $^
 
 # See remark above: force static linking of libthreadsnat.a
 $(LIBNAME).cmxa: $(THREADS_NCOBJS)
 	$(V_LINKOPT)$(CAMLOPT) -linkall -a -cclib -lthreadsnat -o $@ $^
-
-# Note: I removed "-cclib -lunix" from the line above.
-# Indeed, if we link threads.cmxa, then we must also link unix.cmxa,
-# which itself will pass -lunix to the C linker.  It seems more
-# modular to me this way. -- Alain
 
 # The following lines produce two object files st_stubs.b.$(O) and
 # st_stubs.n.$(O) from the same source file st_stubs.c (it is compiled
@@ -95,8 +81,8 @@ st_stubs.%.$(O): st_stubs.c
 else
 st_stubs.%.$(O): st_stubs.c $(RUNTIME_HEADERS) $(wildcard *.h)
 endif
-	$(V_CC)$(CC) -c $(OC_CFLAGS) $(CFLAGS) $(OC_CPPFLAGS) $(CPPFLAGS) \
-	  $(OUTPUTOBJ)$@ $<
+	$(V_CC)$(CC) $(OC_CFLAGS) $(CFLAGS) $(OC_CPPFLAGS) $(CPPFLAGS) \
+	  $(OUTPUTOBJ)$@ -c $<
 
 .PHONY: partialclean
 partialclean:
@@ -154,7 +140,9 @@ ifeq "$(COMPUTE_DEPS)" "true"
 include $(addprefix $(DEPDIR)/, $(DEP_FILES))
 endif
 
-%.n.$(D): OC_CPPFLAGS += $(OC_NATIVE_CPPFLAGS)
+%.b.$(D): OC_CPPFLAGS = $(OC_BYTECODE_CPPFLAGS)
+%.n.$(O): OC_CPPFLAGS = $(OC_NATIVE_CPPFLAGS)
+%.n.$(D): OC_CPPFLAGS = $(OC_NATIVE_CPPFLAGS)
 
 define GEN_RULE
 $(DEPDIR)/%.$(1).$(D): %.c | $(DEPDIR)

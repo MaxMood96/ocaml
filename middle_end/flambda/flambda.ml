@@ -60,8 +60,6 @@ type t =
   | Var of Variable.t
   | Let of let_expr
   | Let_mutable of let_mutable
-  | Let_rec of
-      (Variable.t * Value_rec_types.recursive_binding_kind * named) list * t
   | Apply of apply
   | Send of send
   | Assign of assign
@@ -69,7 +67,8 @@ type t =
   | Switch of Variable.t * switch
   | String_switch of Variable.t * (string * t) list * t option
   | Static_raise of Static_exception.t * Variable.t list
-  | Static_catch of Static_exception.t * Variable.t list * t * t
+  | Static_catch of
+      Static_exception.t * (Variable.t * Lambda.value_kind) list * t * t
   | Try_with of t * Variable.t * t
   | While of t * t
   | For of for_loop
@@ -190,6 +189,11 @@ let print_project_closure = Projection.print_project_closure
 
 (** CR-someday lwhite: use better name than this *)
 let rec lam ppf (flam : t) =
+  let print_kind ppf (kind : Lambda.value_kind) =
+    match kind with
+    | Pgenval -> ()
+    | _ -> Format.fprintf ppf " %a" Printlambda.value_kind kind
+  in
   match flam with
   | Var (id) ->
       Variable.print ppf id
@@ -242,34 +246,11 @@ let rec lam ppf (flam : t) =
       let expr = letbody body in
       fprintf ppf ")@]@ %a)@]" lam expr
   | Let_mutable { var = mut_var; initial_value = var; body; contents_kind } ->
-    let print_kind ppf (kind : Lambda.value_kind) =
-      match kind with
-      | Pgenval -> ()
-      | _ -> Format.fprintf ppf " %a" Printlambda.value_kind kind
-    in
     fprintf ppf "@[<2>(let_mutable%a@ @[<2>%a@ %a@]@ %a)@]"
       print_kind contents_kind
       Mutable_variable.print mut_var
       Variable.print var
       lam body
-  | Let_rec(id_arg_list, body) ->
-      let bindings ppf id_arg_list =
-        let spc = ref false in
-        List.iter
-          (fun (id, rkind, l) ->
-             if !spc then fprintf ppf "@ " else spc := true;
-             let rec_annot =
-               match (rkind : Value_rec_types.recursive_binding_kind) with
-               | Static -> ""
-               | Not_recursive -> "[Nonrec]"
-               | Constant -> "[Cst]"
-               | Class -> "[Class]"
-             in
-             fprintf ppf "@[<2>%a%s@ %a@]"
-               Variable.print id rec_annot print_named l)
-          id_arg_list in
-      fprintf ppf
-        "@[<2>(letrec@ (@[<hv 1>%a@])@ %a)@]" bindings id_arg_list lam body
   | Switch(larg, sw) ->
       let switch ppf (sw : switch) =
         let spc = ref false in
@@ -322,7 +303,8 @@ let rec lam ppf (flam : t) =
            | [] -> ()
            | _ ->
                List.iter
-                 (fun x -> fprintf ppf " %a" Variable.print x)
+                 (fun (x, kind) ->
+                    fprintf ppf " %a%a" Variable.print x print_kind kind)
                  vars)
         vars
         lam lhandler
@@ -562,14 +544,6 @@ let rec variables_usage ?ignore_uses_as_callee ?ignore_uses_as_argument
       | Let_mutable { initial_value = var; body; _ } ->
         free_variable var;
         aux body
-      | Let_rec (bindings, body) ->
-        List.iter (fun (var, _rkind, defining_expr) ->
-            bound_variable var;
-            free_variables
-              (variables_usage_named ?ignore_uses_in_project_var
-                 ~all_used_variables defining_expr))
-          bindings;
-        aux body
       | Switch (scrutinee, switch) ->
         free_variable scrutinee;
         List.iter (fun (_, e) -> aux e) switch.consts;
@@ -582,7 +556,7 @@ let rec variables_usage ?ignore_uses_as_callee ?ignore_uses_as_argument
       | Static_raise (_, es) ->
         List.iter free_variable es
       | Static_catch (_, vars, e1, e2) ->
-        List.iter bound_variable vars;
+        List.iter (fun (v, _) ->  bound_variable v) vars;
         aux e1;
         aux e2
       | Try_with (e1, var, e2) ->
@@ -784,9 +758,6 @@ let iter_general ~toplevel f f_named maybe_named =
       | Static_raise _ -> ()
       | Let _ -> assert false
       | Let_mutable { body; _ } ->
-        aux body
-      | Let_rec (defs, body) ->
-        List.iter (fun (_,_,l) -> aux_named l) defs;
         aux body
       | Try_with (f1,_,f2)
       | While (f1,f2)

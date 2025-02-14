@@ -17,10 +17,9 @@
 
 /* Win32-specific stuff */
 
-/* FILE_INFO_BY_HANDLE_CLASS and FILE_NAME_INFO are only available from Windows
-   Vista onwards */
-#undef _WIN32_WINNT
-#define _WIN32_WINNT 0x0600
+/* FILE_INFO_BY_HANDLE_CLASS, FILE_NAME_INFO, and INIT_ONCE are only
+   available from Windows Vista onwards */
+#define _WIN32_WINNT 0x0600 /* _WIN32_WINNT_VISTA */
 
 #define WIN32_LEAN_AND_MEAN
 #include <wtypes.h>
@@ -28,6 +27,7 @@
 #include <winsock2.h>
 #include <winioctl.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <direct.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -72,7 +72,7 @@ unsigned short caml_win32_minor = 0;
 unsigned short caml_win32_build = 0;
 unsigned short caml_win32_revision = 0;
 
-static CAMLnoret void caml_win32_sys_error(int errnum)
+CAMLnoret static void caml_win32_sys_error(int errnum)
 {
   wchar_t buffer[512];
   value msg;
@@ -153,20 +153,18 @@ wchar_t * caml_search_in_path(struct ext_table * path, const wchar_t * name)
 {
   wchar_t * dir, * fullname;
   char * u8;
-  const wchar_t * p;
-  int i;
   struct _stati64 st;
 
-  for (p = name; *p != 0; p++) {
+  for (const wchar_t *p = name; *p != 0; p++) {
     if (*p == '/' || *p == '\\') goto not_found;
   }
-  for (i = 0; i < path->size; i++) {
+  for (int i = 0; i < path->size; i++) {
     dir = path->contents[i];
     if (dir[0] == 0) continue;
          /* not sure what empty path components mean under Windows */
     fullname = caml_stat_wcsconcat(3, dir, L"\\", name);
     u8 = caml_stat_strdup_of_utf16(fullname);
-    caml_gc_message(0x100, "Searching %s\n", u8);
+    CAML_GC_MESSAGE(STARTUP, "Searching %s\n", u8);
     caml_stat_free(u8);
     if (_wstati64(fullname, &st) == 0 && S_ISREG(st.st_mode))
       return fullname;
@@ -174,7 +172,7 @@ wchar_t * caml_search_in_path(struct ext_table * path, const wchar_t * name)
   }
  not_found:
   u8 = caml_stat_strdup_of_utf16(name);
-  caml_gc_message(0x100, "%s not found in search path\n", u8);
+  CAML_GC_MESSAGE(STARTUP, "%s not found in search path\n", u8);
   caml_stat_free(u8);
   return caml_stat_wcsdup(name);
 }
@@ -198,7 +196,7 @@ CAMLexport wchar_t * caml_search_exe_in_path(const wchar_t * name)
                          &filepart);
     if (retcode == 0) {
       u8 = caml_stat_strdup_of_utf16(name);
-      caml_gc_message(0x100, "%s not found in search path\n", u8);
+      CAML_GC_MESSAGE(STARTUP, "%s not found in search path\n", u8);
       caml_stat_free(u8);
       caml_stat_free(fullname);
       return caml_stat_strdup_os(name);
@@ -229,7 +227,7 @@ void * caml_dlopen(wchar_t * libname, int global)
   int flags = (global ? FLEXDLL_RTLD_GLOBAL : 0);
   handle = flexdll_wdlopen(libname, flags);
   if ((handle != NULL)
-     && ((atomic_load_relaxed(&caml_verb_gc) & 0x100) != 0)) {
+     && ((atomic_load_relaxed(&caml_verb_gc) & CAML_GC_MSG_STARTUP) != 0)) {
     flexdll_dump_exports(handle);
     fflush(stdout);
   }
@@ -349,9 +347,7 @@ static void store_argument(wchar_t * arg)
 
 static void expand_argument(wchar_t * arg)
 {
-  wchar_t * p;
-
-  for (p = arg; *p != 0; p++) {
+  for (wchar_t *p = arg; *p != 0; p++) {
     if (*p == L'*' || *p == L'?') {
       expand_pattern(arg);
       return;
@@ -362,7 +358,7 @@ static void expand_argument(wchar_t * arg)
 
 static void expand_pattern(wchar_t * pat)
 {
-  wchar_t * prefix, * p, * name;
+  wchar_t * prefix, * name;
   intptr_t handle;
   struct _wfinddata_t ffblk;
   size_t i;
@@ -394,12 +390,11 @@ static void expand_pattern(wchar_t * pat)
 
 CAMLexport void caml_expand_command_line(int * argcp, wchar_t *** argvp)
 {
-  int i;
   argc = 0;
   argvsize = 16;
   argv = (wchar_t **) caml_stat_alloc_noexc(argvsize * sizeof(wchar_t *));
   if (argv == NULL) out_of_memory();
-  for (i = 0; i < *argcp; i++) expand_argument((*argvp)[i]);
+  for (int i = 0; i < *argcp; i++) expand_argument((*argvp)[i]);
   argv[argc] = NULL;
   *argcp = argc;
   *argvp = argv;
@@ -809,7 +804,8 @@ int caml_win32_rename(const wchar_t * oldpath, const wchar_t * newpath)
   if ((old_attribs != INVALID_FILE_ATTRIBUTES) &&
       (old_attribs & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
       (new_attribs != INVALID_FILE_ATTRIBUTES) &&
-      (new_attribs & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+      (new_attribs & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+      !PathIsPrefix(oldpath, newpath)) {
     /* Try to delete: RemoveDirectoryW fails on non-empty dirs as intended.
        Then try again. */
     RemoveDirectoryW(newpath);
@@ -955,27 +951,85 @@ CAMLexport value caml_copy_string_of_utf16(const wchar_t *s)
   return v;
 }
 
-CAMLexport wchar_t* caml_stat_strdup_to_utf16(const char *s)
+Caml_inline wchar_t *char_array_to_utf16_noexc(const char *s,
+                                               int slen, size_t *out_size)
 {
   wchar_t * ws;
   int retcode;
 
-  retcode = caml_win32_multi_byte_to_wide_char(s, -1, NULL, 0);
-  ws = caml_stat_alloc_noexc(retcode * sizeof(*ws));
-  caml_win32_multi_byte_to_wide_char(s, -1, ws, retcode);
+  retcode = caml_win32_multi_byte_to_wide_char(s, slen, NULL, 0);
+  ws = caml_stat_alloc_noexc(retcode * sizeof(wchar_t));
+  if (ws != NULL) {
+    caml_win32_multi_byte_to_wide_char(s, slen, ws, retcode);
+    if (out_size != NULL)
+      *out_size = retcode;
+  }
 
   return ws;
 }
 
-CAMLexport caml_stat_string caml_stat_strdup_of_utf16(const wchar_t *s)
+CAMLexport wchar_t *caml_stat_strdup_noexc_to_utf16(const char *s)
+{
+  return char_array_to_utf16_noexc(s, -1, NULL);
+}
+
+CAMLexport wchar_t *caml_stat_strdup_to_utf16(const char *s)
+{
+  wchar_t *out = caml_stat_strdup_noexc_to_utf16(s);
+  if (out == NULL)
+    caml_raise_out_of_memory();
+  return out;
+}
+
+CAMLexport wchar_t *caml_stat_char_array_to_utf16(const char *s, size_t size,
+                                                  size_t *out_size)
+{
+  CAMLassert(size > 0);
+  wchar_t *out = char_array_to_utf16_noexc(s, size, out_size);
+  if (out == NULL)
+    caml_raise_out_of_memory();
+  return out;
+}
+
+Caml_inline caml_stat_string char_array_of_utf16_noexc(const wchar_t *s,
+                                                       int slen,
+                                                       size_t *out_size)
 {
   caml_stat_string out;
   int retcode;
 
-  retcode = caml_win32_wide_char_to_multi_byte(s, -1, NULL, 0);
-  out = caml_stat_alloc(retcode);
-  caml_win32_wide_char_to_multi_byte(s, -1, out, retcode);
+  retcode = caml_win32_wide_char_to_multi_byte(s, slen, NULL, 0);
+  out = caml_stat_alloc_noexc(retcode);
+  if (out != NULL) {
+    caml_win32_wide_char_to_multi_byte(s, slen, out, retcode);
+    if (out_size != NULL)
+      *out_size = retcode;
+  }
 
+  return out;
+}
+
+CAMLexport caml_stat_string caml_stat_strdup_noexc_of_utf16(const wchar_t *s)
+{
+  return char_array_of_utf16_noexc(s, -1, NULL);
+}
+
+CAMLexport caml_stat_string caml_stat_strdup_of_utf16(const wchar_t *s)
+{
+  caml_stat_string out = caml_stat_strdup_noexc_of_utf16(s);
+  if (out == NULL)
+    caml_raise_out_of_memory();
+  return out;
+}
+
+CAMLexport caml_stat_string caml_stat_char_array_of_utf16(const wchar_t *s,
+                                                          size_t size,
+                                                          size_t *out_size)
+{
+  CAMLassert(size > 0);
+  caml_stat_string out = char_array_of_utf16_noexc(s, size, out_size);
+  if (out == NULL)
+    caml_raise_out_of_memory();
   return out;
 }
 
@@ -1022,31 +1076,17 @@ void caml_restore_win32_terminal(void)
 /* Detect if a named pipe corresponds to a Cygwin/MSYS pty: see
    https://github.com/mirror/newlib-cygwin/blob/00e9bf2/winsup/cygwin/dtable.cc#L932
 */
-typedef
-BOOL (WINAPI *tGetFileInformationByHandleEx)(HANDLE, FILE_INFO_BY_HANDLE_CLASS,
-                                             LPVOID, DWORD);
-
 static int caml_win32_is_cygwin_pty(HANDLE hFile)
 {
   char buffer[1024];
   FILE_NAME_INFO * nameinfo = (FILE_NAME_INFO *) buffer;
-  static tGetFileInformationByHandleEx pGetFileInformationByHandleEx =
-    INVALID_HANDLE_VALUE;
-
-  if (pGetFileInformationByHandleEx == INVALID_HANDLE_VALUE)
-    pGetFileInformationByHandleEx =
-      (tGetFileInformationByHandleEx)GetProcAddress(
-        GetModuleHandle(L"KERNEL32.DLL"), "GetFileInformationByHandleEx");
-
-  if (pGetFileInformationByHandleEx == NULL)
-    return 0;
 
   /* Get pipe name. GetFileInformationByHandleEx does not NULL-terminate the
      string, so reduce the buffer size to allow for adding one. */
-  if (! pGetFileInformationByHandleEx(hFile,
-                                      FileNameInfo,
-                                      buffer,
-                                      sizeof(buffer) - sizeof(WCHAR)))
+  if (! GetFileInformationByHandleEx(hFile,
+                                     FileNameInfo,
+                                     buffer,
+                                     sizeof(buffer) - sizeof(WCHAR)))
     return 0;
 
   nameinfo->FileName[nameinfo->FileNameLength / sizeof(WCHAR)] = L'\0';
@@ -1095,7 +1135,6 @@ CAMLexport clock_t caml_win32_clock(void)
 {
   FILETIME _creation, _exit;
   CAML_ULONGLONG_FILETIME stime, utime;
-  ULARGE_INTEGER tmp;
   ULONGLONG clocks_per_sec;
 
   if (!(GetProcessTimes(GetCurrentProcess(), &_creation, &_exit,
@@ -1108,7 +1147,7 @@ CAMLexport clock_t caml_win32_clock(void)
   return (clock_t)((stime.ul + utime.ul) / clocks_per_sec);
 }
 
-static double clock_period = 0;
+static double clock_period_nsec = 0;
 
 void caml_init_os_params(void)
 {
@@ -1123,7 +1162,7 @@ void caml_init_os_params(void)
 
   /* Get the number of nanoseconds for each tick in QueryPerformanceCounter */
   QueryPerformanceFrequency(&frequency);
-  clock_period = (1000000000.0 / frequency.QuadPart);
+  clock_period_nsec = (double) NSEC_PER_SEC / frequency.QuadPart;
 }
 
 uint64_t caml_time_counter(void)
@@ -1131,7 +1170,7 @@ uint64_t caml_time_counter(void)
   LARGE_INTEGER now;
 
   QueryPerformanceCounter(&now);
-  return (uint64_t)(now.QuadPart * clock_period);
+  return (uint64_t) (now.QuadPart * clock_period_nsec);
 }
 
 void *caml_plat_mem_map(uintnat size, int reserve_only)
@@ -1162,7 +1201,7 @@ void caml_plat_mem_unmap(void* mem, uintnat size)
 
 struct error_entry { DWORD win_code; int range; int posix_code; };
 
-static struct error_entry win_error_table[] = {
+static const struct error_entry win_error_table[] = {
   { ERROR_INVALID_FUNCTION, 0, EINVAL},
   { ERROR_FILE_NOT_FOUND, 0, ENOENT},
   { ERROR_PATH_NOT_FOUND, 0, ENOENT},
@@ -1265,4 +1304,32 @@ value caml_win32_xdg_defaults(void)
   CoTaskMemFree(wpath);
 
   CAMLreturn(result);
+}
+
+static INIT_ONCE get_temp_path_init_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK get_temp_path_init_function(PINIT_ONCE InitOnce,
+                                                 PVOID Parameter,
+                                                 PVOID *lpContext)
+{
+  FARPROC pGetTempPath2W =
+    GetProcAddress(GetModuleHandle(L"KERNEL32.DLL"), "GetTempPath2W");
+  if (pGetTempPath2W)
+    *lpContext = pGetTempPath2W;
+  else
+    *lpContext = GetTempPath;
+  return TRUE;
+}
+
+value caml_win32_get_temp_path(void)
+{
+  CAMLparam0();
+  wchar_t buf[MAX_PATH+1];
+  DWORD (WINAPI *get_temp_path)(DWORD, LPWSTR);
+
+  InitOnceExecuteOnce(&get_temp_path_init_once, get_temp_path_init_function,
+                      NULL, (LPVOID *) &get_temp_path);
+
+  if (!get_temp_path(MAX_PATH+1, buf))
+    caml_win32_sys_error(GetLastError());
+  CAMLreturn(caml_copy_string_of_utf16(buf));
 }

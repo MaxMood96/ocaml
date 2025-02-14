@@ -22,29 +22,15 @@
 #include <pthread.h>
 #include <signal.h>
 #include <time.h>
-#ifdef HAS_UNISTD
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 
-typedef int st_retcode;
-
-/* Variables used to stop "tick" threads */
-static atomic_uintnat tick_thread_stop[Max_domains];
-#define Tick_thread_stop tick_thread_stop[Caml_state->id]
-
-/* OS-specific initialization */
-
-static int st_initialize(void)
-{
-  atomic_store_release(&Tick_thread_stop, 0);
-  return 0;
-}
-
-/* Thread creation.  Created in detached mode if [res] is NULL. */
 
 typedef pthread_t st_thread_id;
 
 
+/* Thread creation. Created in detached mode if [res] is NULL. */
 static int st_thread_create(st_thread_id * res,
                             void * (*fn)(void *), void * arg)
 {
@@ -94,10 +80,10 @@ Caml_inline void st_tls_set(st_tlskey k, void * v)
    threads. */
 
 typedef struct {
-  int init;                       /* have the mutex and the cond been
+  bool init;                      /* have the mutex and the cond been
                                      initialized already? */
   pthread_mutex_t lock;           /* to protect contents */
-  uintnat busy;                   /* 0 = free, 1 = taken */
+  bool busy;                      /* false = free, true = taken */
   atomic_uintnat waiters;         /* number of threads waiting on master lock */
   pthread_cond_t is_free;         /* signaled when free */
 } st_masterlock;
@@ -111,9 +97,9 @@ static int st_masterlock_init(st_masterlock * m)
     if (rc != 0) goto out_err;
     rc = pthread_cond_init(&m->is_free, NULL);
     if (rc != 0) goto out_err2;
-    m->init = 1;
+    m->init = true;
   }
-  m->busy = 1;
+  m->busy = true;
   atomic_store_release(&m->waiters, 0);
   return 0;
 
@@ -128,35 +114,6 @@ static uintnat st_masterlock_waiters(st_masterlock * m)
   return atomic_load_acquire(&m->waiters);
 }
 
-static void st_bt_lock_acquire(st_masterlock *m) {
-
-  /* We do not want to signal the backup thread if it is not "working"
-     as it may very well not be, because we could have just resumed
-     execution from another thread right away. */
-  if (caml_bt_is_in_blocking_section()) {
-    caml_bt_enter_ocaml();
-  }
-
-  caml_acquire_domain_lock();
-
-  return;
-}
-
-static void st_bt_lock_release(st_masterlock *m) {
-
-  /* Here we do want to signal the backup thread iff there's
-     no thread waiting to be scheduled, and the backup thread is currently
-     idle. */
-  if (st_masterlock_waiters(m) == 0 &&
-      caml_bt_is_in_blocking_section() == 0) {
-    caml_bt_exit_ocaml();
-  }
-
-  caml_release_domain_lock();
-
-  return;
-}
-
 static void st_masterlock_acquire(st_masterlock *m)
 {
   pthread_mutex_lock(&m->lock);
@@ -165,8 +122,8 @@ static void st_masterlock_acquire(st_masterlock *m)
     pthread_cond_wait(&m->is_free, &m->lock);
     atomic_fetch_add(&m->waiters, -1);
   }
-  m->busy = 1;
-  st_bt_lock_acquire(m);
+  m->busy = true;
+  st_bt_lock_acquire();
   pthread_mutex_unlock(&m->lock);
 
   return;
@@ -175,8 +132,8 @@ static void st_masterlock_acquire(st_masterlock *m)
 static void st_masterlock_release(st_masterlock * m)
 {
   pthread_mutex_lock(&m->lock);
-  m->busy = 0;
-  st_bt_lock_release(m);
+  m->busy = false;
+  st_bt_lock_release(st_masterlock_waiters(m) == 0);
   pthread_cond_signal(&m->is_free);
   pthread_mutex_unlock(&m->lock);
 
@@ -207,7 +164,7 @@ Caml_inline void st_thread_yield(st_masterlock * m)
     return;
   }
 
-  m->busy = 0;
+  m->busy = false;
   atomic_fetch_add(&m->waiters, +1);
   pthread_cond_signal(&m->is_free);
   /* releasing the domain lock but not triggering bt messaging
@@ -224,7 +181,7 @@ Caml_inline void st_thread_yield(st_masterlock * m)
        pthread_cond_wait(&m->is_free, &m->lock);
   } while (m->busy);
 
-  m->busy = 1;
+  m->busy = true;
   atomic_fetch_add(&m->waiters, -1);
 
   caml_acquire_domain_lock();
@@ -238,7 +195,7 @@ Caml_inline void st_thread_yield(st_masterlock * m)
 
 typedef struct st_event_struct {
   pthread_mutex_t lock;         /* to protect contents */
-  int status;                   /* 0 = not triggered, 1 = triggered */
+  bool status;                  /* false = not triggered, true = triggered */
   pthread_cond_t triggered;     /* signaled when triggered */
 } * st_event;
 
@@ -253,7 +210,7 @@ static int st_event_create(st_event * res)
   rc = pthread_cond_init(&e->triggered, NULL);
   if (rc != 0)
   { pthread_mutex_destroy(&e->lock); caml_stat_free(e); return rc; }
-  e->status = 0;
+  e->status = false;
   *res = e;
   return 0;
 }
@@ -272,7 +229,7 @@ static int st_event_trigger(st_event e)
   int rc;
   rc = pthread_mutex_lock(&e->lock);
   if (rc != 0) return rc;
-  e->status = 1;
+  e->status = true;
   rc = pthread_mutex_unlock(&e->lock);
   if (rc != 0) return rc;
   rc = pthread_cond_broadcast(&e->triggered);
@@ -284,28 +241,10 @@ static int st_event_wait(st_event e)
   int rc;
   rc = pthread_mutex_lock(&e->lock);
   if (rc != 0) return rc;
-  while(e->status == 0) {
+  while(!e->status) {
     rc = pthread_cond_wait(&e->triggered, &e->lock);
     if (rc != 0) return rc;
   }
   rc = pthread_mutex_unlock(&e->lock);
   return rc;
-}
-
-/* The tick thread: interrupt the domain periodically to force preemption  */
-
-static void * caml_thread_tick(void * arg)
-{
-  int *domain_id = (int *) arg;
-
-  caml_init_domain_self(*domain_id);
-  caml_domain_state *domain = Caml_state;
-
-  while(! atomic_load_acquire(&Tick_thread_stop)) {
-    st_msleep(Thread_timeout);
-
-    atomic_store_release(&domain->requested_external_interrupt, 1);
-    caml_interrupt_self();
-  }
-  return NULL;
 }

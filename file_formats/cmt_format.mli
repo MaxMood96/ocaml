@@ -50,11 +50,11 @@ and binary_part =
   | Partial_signature_item of signature_item
   | Partial_module_type of module_type
 
+type dependency_kind = Definition_to_declaration | Declaration_to_declaration
 type cmt_infos = {
   cmt_modname : modname;
   cmt_annots : binary_annots;
-  cmt_value_dependencies :
-    (Types.value_description * Types.value_description) list;
+  cmt_declaration_dependencies : (dependency_kind * Uid.t * Uid.t) list;
   cmt_comments : (string * Location.t) list;
   cmt_args : string array;
   cmt_sourcefile : string option;
@@ -65,8 +65,10 @@ type cmt_infos = {
   cmt_imports : crcs;
   cmt_interface_digest : Digest.t option;
   cmt_use_summaries : bool;
-  cmt_uid_to_loc : Location.t Shape.Uid.Tbl.t;
+  cmt_uid_to_decl : item_declaration Shape.Uid.Tbl.t;
   cmt_impl_shape : Shape.t option; (* None for mli *)
+  cmt_ident_occurrences :
+    (Longident.t Location.loc * Shape_reduce.result) list
 }
 
 type error =
@@ -107,9 +109,7 @@ val add_saved_type : binary_part -> unit
 val get_saved_types : unit -> binary_part list
 val set_saved_types : binary_part list -> unit
 
-val record_value_dependency:
-  Types.value_description -> Types.value_description -> unit
-
+val record_declaration_dependency: dependency_kind * Uid.t * Uid.t -> unit
 
 (*
 

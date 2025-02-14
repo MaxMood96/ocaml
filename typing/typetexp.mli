@@ -92,13 +92,19 @@ type error =
   | Method_mismatch of string * type_expr * type_expr
   | Opened_object of Path.t option
   | Not_an_object of type_expr
+  | Repeated_tuple_label of string
 
 exception Error of Location.t * Env.t * error
 
-val report_error: Env.t -> Format.formatter -> error -> unit
+val report_error: Env.t -> error Format_doc.format_printer
+val report_error_doc: Env.t -> error Format_doc.printer
 
 (* Support for first-class modules. *)
 val transl_modtype_longident:  (* from Typemod *)
     (Location.t -> Env.t -> Longident.t -> Path.t) ref
 val transl_modtype: (* from Typemod *)
     (Env.t -> Parsetree.module_type -> Typedtree.module_type) ref
+val check_package_with_type_constraints: (* from Typemod *)
+    (Location.t -> Env.t -> Types.module_type ->
+     (Longident.t Asttypes.loc * Typedtree.core_type) list ->
+     Types.module_type) ref

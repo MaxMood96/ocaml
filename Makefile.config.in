@@ -46,7 +46,7 @@ BINDIR=@bindir@
 
 datarootdir=@datarootdir@
 
-### Where to install the standard library
+### Where to install the standard library on host
 LIBDIR=@libdir@
 
 ### Where to install the stub code for the standard library
@@ -58,15 +58,6 @@ STUBLIBDIR=@libdir@/stublibs
 MANDIR=@mandir@
 PROGRAMS_MAN_DIR=$(MANDIR)/man1
 LIBRARIES_MAN_DIR=$(MANDIR)/man3
-
-### Do #! scripts work on your system?
-### Beware: on some systems (e.g. SunOS 4), this will work only if
-### the string "#!$(BINDIR)/ocamlrun" is less than 32 characters long.
-### In doubt, set HASHBANGSCRIPTS to false.
-SHEBANGSCRIPTS=@shebangscripts@
-LONG_SHEBANG=@long_shebang@
-# For compatibility
-HASHBANGSCRIPTS:=$(SHEBANGSCRIPTS)
 
 ### Path to the libtool script
 LIBTOOL = $(TOP_BUILDDIR)/libtool
@@ -170,10 +161,11 @@ INSTALL_SOURCE_ARTIFACTS=@install_source_artifacts@
 
 CFLAGS=@CFLAGS@
 CPPFLAGS=@CPPFLAGS@
-OCAMLC_CFLAGS=@ocamlc_cflags@
+BYTECODE_CFLAGS=@bytecode_cflags@
 
-OCAMLC_CPPFLAGS=@ocamlc_cppflags@
-BYTECCLIBS=@cclibs@
+BYTECODE_CPPFLAGS=@bytecode_cppflags@
+ZSTD_LIBS=@zstd_libs@
+BYTECCLIBS=@zstd_libs@ @cclibs@
 EXE=@exeext@
 OUTPUTEXE=@outputexe@$(EMPTY)
 SUPPORTS_SHARED_LIBRARIES=@supports_shared_libraries@
@@ -183,12 +175,16 @@ NATDYNLINK=@natdynlink@
 NATDYNLINKOPTS=@natdynlinkopts@
 SYSLIB=@syslib@
 MKLIB=@mklib@
-# #7678: ocamlopt uses these only to compile .c files, and the behaviour for the
-#        two drivers should be identical.
-OCAMLOPT_CFLAGS=@ocamlc_cflags@
-OCAMLOPT_CPPFLAGS=@ocamlc_cppflags@
+
+# The following variable defines flags to be passed to the C preprocessor
+# when compiling C files to be linked with native code. This includes
+# the native runtime itself and can also include the stub code around
+# C libraries when it needs to be different from the one used to
+# link with bytecode.
+
 NATIVECCLIBS=@cclibs@
 SYSTHREAD_SUPPORT=@systhread_support@
+STRIP=@STRIP@
 PACKLD=@PACKLD@$(EMPTY)
 CCOMPTYPE=@ccomptype@
 TOOLCHAIN=@toolchain@
@@ -214,6 +210,7 @@ HOST=@host@
 FLAMBDA=@flambda@
 WITH_FLAMBDA_INVARIANTS=@flambda_invariants@
 WITH_CMM_INVARIANTS=@cmm_invariants@
+WITH_CODEGEN_INVARIANTS=@codegen_invariants@
 FORCE_SAFE_STRING=true
 DEFAULT_SAFE_STRING=true
 WINDOWS_UNICODE=@windows_unicode@
@@ -225,11 +222,20 @@ NAKED_POINTERS=false
 
 # Deprecated variables
 
+## Variables deprecated since OCaml 5.3
+
+OCAMLC_CFLAGS=@bytecode_cflags@
+OCAMLOPT_CFLAGS=@native_cflags@
+OCAMLC_CPPFLAGS=@bytecode_cppflags@
+OCAMLOPT_CPPFLAGS=@native_cppflags@
+
 ## Variables deprecated since OCaml 5.2
 
 STDLIB_MANPAGES=@build_libraries_manpages@
 WITH_OCAMLDOC=@with_ocamldoc@
 WITH_OCAMLTEST=@ocamltest@
+SHEBANGSCRIPTS=@shebangscripts@
+HASHBANGSCRIPTS=$(SHEBANGSCRIPTS)
 
 ## Variables deprecated since OCaml 5.0
 

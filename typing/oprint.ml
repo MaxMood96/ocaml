@@ -13,7 +13,7 @@
 (*                                                                        *)
 (**************************************************************************)
 
-open Format
+open Format_doc
 open Outcometree
 
 exception Ellipsis
@@ -37,28 +37,9 @@ let rec print_ident ppf =
 
 let out_ident = ref print_ident
 
-(* Check a character matches the [identchar_latin1] class from the lexer *)
-let is_ident_char c =
-  match c with
-  | 'A'..'Z' | 'a'..'z' | '_' | '\192'..'\214' | '\216'..'\246'
-  | '\248'..'\255' | '\'' | '0'..'9' -> true
-  | _ -> false
-
-let all_ident_chars s =
-  let rec loop s len i =
-    if i < len then begin
-      if is_ident_char s.[i] then loop s len (i+1)
-      else false
-    end else begin
-      true
-    end
-  in
-  let len = String.length s in
-  loop s len 0
-
 let parenthesized_ident name =
   (List.mem name ["or"; "mod"; "land"; "lor"; "lxor"; "lsl"; "lsr"; "asr"])
-  || not (all_ident_chars name)
+  || not (Misc.Utf8_lexeme.is_valid_identifier name)
 
 let value_ident ppf name =
   if parenthesized_ident name then
@@ -141,6 +122,20 @@ let escape_string s =
     Bytes.to_string s'
   end
 
+let print_label_type ppf =
+  function
+  | Some s ->
+    pp_print_string ppf s;
+    pp_print_string ppf ":";
+  | None -> ()
+
+let print_label ppf =
+  function
+  | Some s ->
+    pp_print_string ppf "~";
+    pp_print_string ppf s;
+    pp_print_string ppf ":";
+  | None -> ()
 
 let print_out_string ppf s =
   let not_escaped =
@@ -162,6 +157,9 @@ let print_constr ppf name =
     (* despite being keywords, these are constructor names
        and should not be escaped *)
     fprintf ppf "%s" c
+  | Oide_dot (id, ("true"|"false" as s)) ->
+      (* Similarly, M.true is invalid *)
+      fprintf ppf "%a.(%s)" print_ident id s
   | _ -> print_ident ppf name
 
 let print_out_value ppf tree =
@@ -216,7 +214,7 @@ let print_out_value ppf tree =
         end
     | Oval_list tl ->
         fprintf ppf "@[<1>[%a]@]" (print_tree_list print_tree_1 ";") tl
-    | Oval_array tl ->
+    | Oval_array (tl, _mutability) ->
         fprintf ppf "@[<2>[|%a|]@]" (print_tree_list print_tree_1 ";") tl
     | Oval_constr (name, []) -> print_constr ppf name
     | Oval_variant (name, None) -> fprintf ppf "`%a" print_lident name
@@ -226,7 +224,14 @@ let print_out_value ppf tree =
     | Oval_ellipsis -> raise Ellipsis
     | Oval_printer f -> f ppf
     | Oval_tuple tree_list ->
-        fprintf ppf "@[<1>(%a)@]" (print_tree_list print_tree_1 ",") tree_list
+        let print_elem ppf (lbl, item) =
+          print_label ppf lbl; print_tree_1 ppf item
+        in
+        fprintf ppf "@[<1>(%a)@]" (print_tree_list print_elem ",") tree_list
+    | Oval_floatarray arr ->
+       fprintf ppf "@[<2>[|%a|]@]"
+         (pp_print_seq ~pp_sep:semicolon pp_print_float)
+         (Float.Array.to_seq arr)
     | tree -> fprintf ppf "@[<1>(%a)@]" (cautious print_tree_1) tree
   and print_fields first ppf =
     function
@@ -236,7 +241,8 @@ let print_out_value ppf tree =
         fprintf ppf "@[<1>%a@ =@ %a@]" print_ident name (cautious print_tree_1)
           tree;
         print_fields false ppf fields
-  and print_tree_list print_item sep ppf tree_list =
+  and print_tree_list : 'a . (_ -> 'a -> _) -> _ -> _ -> 'a list -> unit =
+    fun print_item sep ppf tree_list ->
     let rec print_list first ppf =
       function
         [] -> ()
@@ -249,7 +255,7 @@ let print_out_value ppf tree =
   in
   cautious print_tree_1 ppf tree
 
-let out_value = ref print_out_value
+let out_value = ref (compat print_out_value)
 
 (* Types *)
 
@@ -267,7 +273,7 @@ let rec print_list pr sep ppf =
 let pr_present =
   print_list (fun ppf s -> fprintf ppf "`%s" s) (fun ppf -> fprintf ppf "@ ")
 
-let pr_var = Pprintast.tyvar
+let pr_var = Pprintast.Doc.tyvar
 let ty_var ~non_gen ppf s =
   pr_var ppf (if non_gen then "_" ^ s else s)
 
@@ -298,16 +304,31 @@ and print_out_type_1 ppf =
     Otyp_arrow (lab, ty1, ty2) ->
       pp_open_box ppf 0;
       print_arg_label ppf lab;
-      print_out_type_2 ppf ty1;
+      print_out_type_2 ~arg:true ppf ty1;
       pp_print_string ppf " ->";
       pp_print_space ppf ();
       print_out_type_1 ppf ty2;
       pp_close_box ppf ()
-  | ty -> print_out_type_2 ppf ty
-and print_out_type_2 ppf =
+  | ty -> print_out_type_2 ~arg:false ppf ty
+and print_out_type_2 ~arg ppf =
   function
     Otyp_tuple tyl ->
-      fprintf ppf "@[<0>%a@]" (print_typlist print_simple_out_type " *") tyl
+      (* Tuples require parens in argument function argument position (~arg)
+         when the first element has a label. *)
+      let parens =
+        match tyl with
+        | (Some _, _) :: _ -> arg
+        | _ -> false
+      in
+      if parens then pp_print_char ppf '(';
+      let print_elem ppf (label, ty) =
+        pp_open_box ppf 0;
+        print_label_type ppf label;
+        print_simple_out_type ppf ty;
+        pp_close_box ppf ()
+      in
+      fprintf ppf "@[<0>%a@]" (print_typlist print_elem " *") tyl;
+      if parens then pp_print_char ppf ')'
   | ty -> print_simple_out_type ppf ty
 and print_simple_out_type ppf =
   function
@@ -384,8 +405,9 @@ and print_row_field ppf (l, opt_amp, tyl) =
   fprintf ppf "@[<hv 2>`%a%t%a@]" print_lident l pr_of
     (print_typlist print_out_type " &")
     tyl
-and print_typlist print_elem sep ppf =
-  function
+and print_typlist : 'a . (_ -> 'a -> _) -> _ -> _ -> 'a list -> _ =
+  fun print_elem sep ppf tyl ->
+  match tyl with
     [] -> ()
   | [ty] -> print_elem ppf ty
   | ty :: tyl ->
@@ -404,10 +426,13 @@ and print_typargs ppf =
       pp_print_char ppf ')';
       pp_close_box ppf ();
       pp_print_space ppf ()
-and print_out_label ppf (name, mut, arg) =
-  fprintf ppf "@[<2>%s%a :@ %a@];" (if mut then "mutable " else "")
-    print_lident name
-    print_out_type arg
+and print_out_label ppf {olab_name; olab_mut; olab_type} =
+  fprintf ppf "@[<2>%s%a :@ %a@];"
+    (match olab_mut with
+     | Mutable -> "mutable "
+     | Immutable -> "")
+    print_lident olab_name
+    print_out_type olab_type
 
 let out_label = ref print_out_label
 
@@ -447,7 +472,7 @@ let rec print_out_class_type ppf =
       fprintf ppf "@[%a%a@]" pr_tyl tyl print_ident id
   | Octy_arrow (lab, ty, cty) ->
       fprintf ppf "@[%a%a ->@ %a@]" print_arg_label lab
-        print_out_type_2 ty print_out_class_type cty
+        (print_out_type_2 ~arg:true) ty print_out_class_type cty
   | Octy_signature (self_ty, csil) ->
       let pr_param ppf =
         function
@@ -555,7 +580,7 @@ and print_out_functor_parameters ppf l =
           print_args l
     | _ :: _ as non_anonymous_functor ->
         let args, anons = split_anon_functor_arguments non_anonymous_functor in
-        fprintf ppf "@[<2>functor@ %a@]@ ->@ %a"
+        fprintf ppf "@[%a@]@ ->@ %a"
           (pp_print_list ~pp_sep:pp_print_space print_nonanon_arg) args
           print_args anons
   in
@@ -813,6 +838,8 @@ let _ = out_functor_parameters := print_out_functor_parameters
 
 (* Phrases *)
 
+open Format
+
 let print_out_exception ppf exn outv =
   match exn with
     Sys.Break -> fprintf ppf "Interrupted.@."
@@ -847,23 +874,26 @@ let rec print_items ppf =
           otyext_constructors = exts;
           otyext_private = ext.oext_private }
       in
-        fprintf ppf "@[%a@]" !out_type_extension te;
+        fprintf ppf "@[%a@]" (Format_doc.compat !out_type_extension) te;
         if items <> [] then fprintf ppf "@ %a" print_items items
   | (tree, valopt) :: items ->
       begin match valopt with
         Some v ->
-          fprintf ppf "@[<2>%a =@ %a@]" !out_sig_item tree
+          fprintf ppf "@[<2>%a =@ %a@]" (Format_doc.compat !out_sig_item) tree
             !out_value v
-      | None -> fprintf ppf "@[%a@]" !out_sig_item tree
+      | None -> fprintf ppf "@[%a@]" (Format_doc.compat !out_sig_item) tree
       end;
       if items <> [] then fprintf ppf "@ %a" print_items items
 
 let print_out_phrase ppf =
   function
     Ophr_eval (outv, ty) ->
-      fprintf ppf "@[- : %a@ =@ %a@]@." !out_type ty !out_value outv
+      fprintf ppf "@[- : %a@ =@ %a@]@." (compat !out_type) ty !out_value outv
   | Ophr_signature [] -> ()
   | Ophr_signature items -> fprintf ppf "@[<v>%a@]@." print_items items
   | Ophr_exception (exn, outv) -> print_out_exception ppf exn outv
 
 let out_phrase = ref print_out_phrase
+
+type 'a printer = 'a Format_doc.printer ref
+type 'a toplevel_printer = (Format.formatter -> 'a -> unit) ref

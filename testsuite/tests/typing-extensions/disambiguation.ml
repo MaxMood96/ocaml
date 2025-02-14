@@ -19,8 +19,7 @@ type t = ..
 type t += Alpha | Aleph
 module M : sig type w = .. type w += Alpha | Beta type t += Beth end
 module F :
-  functor (X : sig end) ->
-    sig type u = .. type t += Gamma type u += Gamme end
+  (X : sig end) -> sig type u = .. type t += Gamma type u += Gamme end
 module X : sig end
 |}]
 
@@ -134,7 +133,7 @@ module FX = F(X) open FX
 type exn += Beth;;
 let x : X.t = Beth;;
 [%%expect {|
-module F : functor (X : sig type t = .. end) -> sig type X.t += Beth end
+module F : (X : sig type t = .. end) -> sig type X.t += Beth end
 module X : sig type t = .. end
 module FX : sig type X.t += Beth end
 type exn += Beth
@@ -242,8 +241,8 @@ type b = Unique
 Line 7, characters 8-14:
 7 | let x = Unique;;
             ^^^^^^
-Warning 41 [ambiguous-name]: Unique belongs to several types: b M.s t a
-The first one was selected. Please disambiguate if this is wrong.
+Warning 41 [ambiguous-name]: "Unique" belongs to several types: "b" "M.s" "t" "a".
+  The first one was selected. Please disambiguate if this is wrong.
 
 val x : b = Unique
 |}]

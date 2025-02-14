@@ -15,16 +15,6 @@
 
 #define CAML_INTERNALS
 
-#if defined(_MSC_VER) && _MSC_VER >= 1400 && _MSC_VER < 1700
-/* Microsoft introduced a regression in Visual Studio 2005 (technically it's
-   not present in the Windows Server 2003 SDK which has a pre-release version)
-   and the abort function ceased to be declared __declspec(noreturn). This was
-   fixed in Visual Studio 2012. Trick stdlib.h into not defining abort (this
-   means exit and _exit are not defined either, but they aren't required). */
-#define _CRT_TERMINATE_DEFINED
-__declspec(noreturn) void __cdecl abort(void);
-#endif
-
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
@@ -46,15 +36,26 @@ _Atomic caml_timing_hook caml_finalise_begin_hook = (caml_timing_hook)NULL;
 _Atomic caml_timing_hook caml_finalise_end_hook = (caml_timing_hook)NULL;
 
 #ifdef DEBUG
-
-void caml_failed_assert (char * expr, char_os * file_os, int line)
-{
+void caml_print_loc(const char_os *file_os, int line) {
   char* file = caml_stat_strdup_of_os(file_os);
-  fprintf(stderr, "[%02d] file %s; line %d ### Assertion failed: %s\n",
-          (Caml_state_opt != NULL) ? Caml_state_opt->id : -1, file, line, expr);
-  fflush(stderr);
+  fprintf(stderr, "[%02d] file %s; line %d ### ",
+          (Caml_state_opt != NULL) ? Caml_state_opt->id : -1, file, line);
   caml_stat_free(file);
-  abort();
+}
+
+void caml_failed_assert (const char * expr, const char_os * file_os, int line)
+{
+  caml_print_loc(file_os, line);
+  fprintf(stderr, "Assertion failed: %s\n", expr);
+  fflush(stderr);
+  caml_abort();
+}
+
+CAMLnoret void caml_debug_abort(const char_os * file_os, int line) {
+  caml_print_loc(file_os, line);
+  fprintf(stderr, "Abort\n");
+  fflush(stderr);
+  caml_abort();
 }
 #endif
 
@@ -79,9 +80,9 @@ void caml_alloc_point_here(void)
 
 atomic_uintnat caml_verb_gc = 0;
 
-void caml_gc_log (char *msg, ...)
+void caml_gc_log (const char *msg, ...)
 {
-  if ((atomic_load_relaxed(&caml_verb_gc) & 0x800) != 0) {
+  if ((atomic_load_relaxed(&caml_verb_gc) & CAML_GC_MSG_DEBUG) != 0) {
     char fmtbuf[GC_LOG_LENGTH];
     va_list args;
     va_start (args, msg);
@@ -93,7 +94,7 @@ void caml_gc_log (char *msg, ...)
   }
 }
 
-void caml_gc_message (int level, char *msg, ...)
+void caml_gc_message (int level, const char *msg, ...)
 {
   if ((atomic_load_relaxed(&caml_verb_gc) & level) != 0){
     va_list ap;
@@ -106,7 +107,7 @@ void caml_gc_message (int level, char *msg, ...)
 
 _Atomic fatal_error_hook caml_fatal_error_hook = (fatal_error_hook)NULL;
 
-CAMLexport void caml_fatal_error (char *msg, ...)
+CAMLexport void caml_fatal_error (const char *msg, ...)
 {
   va_list ap;
   fatal_error_hook hook;
@@ -120,6 +121,9 @@ CAMLexport void caml_fatal_error (char *msg, ...)
     fprintf (stderr, "\n");
   }
   va_end(ap);
+  /* We could use [caml_abort()] instead of [abort()], but misc.h
+     documents that we call [abort()] so we kept this version
+     for compatibility. */
   abort();
 }
 
@@ -182,8 +186,7 @@ int caml_ext_table_add(struct ext_table * tbl, caml_stat_block data)
 
 void caml_ext_table_remove(struct ext_table * tbl, caml_stat_block data)
 {
-  int i;
-  for (i = 0; i < tbl->size; i++) {
+  for (int i = 0; i < tbl->size; i++) {
     if (tbl->contents[i] == data) {
       caml_stat_free(tbl->contents[i]);
       memmove(&tbl->contents[i], &tbl->contents[i + 1],
@@ -195,9 +198,8 @@ void caml_ext_table_remove(struct ext_table * tbl, caml_stat_block data)
 
 void caml_ext_table_clear(struct ext_table * tbl, int free_entries)
 {
-  int i;
   if (free_entries) {
-    for (i = 0; i < tbl->size; i++) caml_stat_free(tbl->contents[i]);
+    for (int i = 0; i < tbl->size; i++) caml_stat_free(tbl->contents[i]);
   }
   tbl->size = 0;
 }
@@ -210,7 +212,8 @@ void caml_ext_table_free(struct ext_table * tbl, int free_entries)
 
 /* Integer arithmetic with overflow detection */
 
-#if ! (__GNUC__ >= 5 || Caml_has_builtin(__builtin_mul_overflow))
+#if ! (__has_builtin(__builtin_mul_overflow) || \
+       defined(__GNUC__) && __GNUC__ >= 5)
 CAMLexport int caml_umul_overflow(uintnat a, uintnat b, uintnat * res)
 {
 #define HALF_SIZE (sizeof(uintnat) * 4)
@@ -280,7 +283,8 @@ void caml_bad_caml_state(void)
    un-instruments function, this simply silences reports when the call stack
    contains a frame matching one of the lines starting with "race:". */
 const char * __tsan_default_suppressions(void) {
-  return "deadlock:caml_plat_lock\n" /* Avoids deadlock inversion messages */
+  return "deadlock:caml_plat_lock_blocking\n" /* Avoids deadlock inversion
+                                                 messages */
          "deadlock:pthread_mutex_lock\n"; /* idem */
 }
 #endif /* WITH_THREAD_SANITIZER */

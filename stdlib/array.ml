@@ -23,8 +23,8 @@ external get: 'a array -> int -> 'a = "%array_safe_get"
 external set: 'a array -> int -> 'a -> unit = "%array_safe_set"
 external unsafe_get: 'a array -> int -> 'a = "%array_unsafe_get"
 external unsafe_set: 'a array -> int -> 'a -> unit = "%array_unsafe_set"
-external make: int -> 'a -> 'a array = "caml_make_vect"
-external create: int -> 'a -> 'a array = "caml_make_vect"
+external make: int -> 'a -> 'a array = "caml_array_make"
+external create: int -> 'a -> 'a array = "caml_array_make"
 external unsafe_sub : 'a array -> int -> int -> 'a array = "caml_array_sub"
 external append_prim : 'a array -> 'a array -> 'a array = "caml_array_append"
 external concat : 'a array list -> 'a array = "caml_array_concat"
@@ -32,7 +32,7 @@ external unsafe_blit :
   'a array -> int -> 'a array -> int -> int -> unit = "caml_array_blit"
 external unsafe_fill :
   'a array -> int -> int -> 'a -> unit = "caml_array_fill"
-external create_float: int -> float array = "caml_make_float_vect"
+external create_float: int -> float array = "caml_array_create_float"
 
 module Floatarray = struct
   external create : int -> floatarray = "caml_floatarray_create"
@@ -439,11 +439,19 @@ let stable_sort cmp a =
 
 let fast_sort = stable_sort
 
+let shuffle_contract_violation i j =
+  let int = string_of_int in
+  invalid_arg
+    ("Array.shuffle: 'rand " ^ int (i + 1) ^
+     "' returned " ^ int j ^
+     ", out of expected range [0; " ^ int i ^ "]")
+
 let shuffle ~rand a = (* Fisher-Yates *)
   for i = length a - 1 downto 1 do
     let j = rand (i + 1) in
+    if not (0 <= j && j <= i) then shuffle_contract_violation i j;
     let v = unsafe_get a i in
-    unsafe_set a i (get a j);
+    unsafe_set a i (unsafe_get a j);
     unsafe_set a j v
   done
 

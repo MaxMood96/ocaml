@@ -40,10 +40,6 @@
 #include <wtypes.h>
 #else
 #include <sys/mman.h>
-#endif
-
-
-#if defined(HAS_UNISTD)
 #include <unistd.h>
 #endif
 
@@ -65,22 +61,22 @@ potentially only read the ring when some anomalous event occurs. No coordination
 is needed with consumers who read the events - they detect races with the
 producer and discard events when that happens.
 
-The producer code is contained here . By default a <pid>.events file is
-created in the current directory (overridable by setting
-OCAML_RUNTIME_EVENTS_DIR). This file contains a ring buffer for each possible
-domain (Max_domains). It is laid out in a structure that enables sparsity.
-On-disk (or in-memory) footprint is proportional to the max number of concurrent
-domains the process has ever run.
+The producer code is contained here . By default a <pid>.events file is created
+in the current directory (overridable by setting OCAML_RUNTIME_EVENTS_DIR).
+This file contains a ring buffer for each possible domain
+(caml_params->max_domains). It is laid out in a structure that enables sparsity.
+On-disk (or in-memory) footprint is proportional to the max number of
+concurrent domains the process has ever run.
 
 On disk structure:
 
 ----------------------------------------------------------------
 | File header (version, offsets, etc..)                        |
 ----------------------------------------------------------------
-| Ring 0..Max_domains metadata                                 |
+| Ring 0..caml_params->max_domains metadata                     |
 | (head and tail indexes, one per cache line)                  |
 ----------------------------------------------------------------
-| Ring 0..Max_domains data                                     |
+| Ring 0..caml_params->max_domains data                         |
 | (actual ring data, default 2^16 words = 512k bytes)          |
 ----------------------------------------------------------------
 | Custom event IDs                                             |
@@ -123,9 +119,6 @@ static value user_events = Val_none;
 static caml_plat_mutex user_events_lock;
 
 /* Custom type write buffer */
-static value write_buffer = Val_none;
-static caml_plat_mutex write_buffer_lock;
-
 static void write_to_ring(ev_category category, ev_message_type type,
                           int event_id, int event_length, uint64_t *content,
                           int word_offset);
@@ -133,12 +126,15 @@ static void write_to_ring(ev_category category, ev_message_type type,
 static void events_register_write_buffer(int index, value event_name);
 static void runtime_events_create_from_stw_single(void);
 
+static void stw_teardown_runtime_events(
+  caml_domain_state *domain_state,
+  void *remove_file_data, int num_participating,
+  caml_domain_state **participating_domains);
+
 void caml_runtime_events_init(void) {
 
   caml_plat_mutex_init(&user_events_lock);
   caml_register_generational_global_root(&user_events);
-
-  caml_plat_mutex_init(&write_buffer_lock);
 
   runtime_events_path = caml_secure_getenv(T("OCAML_RUNTIME_EVENTS_DIR"));
 
@@ -186,21 +182,6 @@ static void runtime_events_teardown_from_stw_single(int remove_file) {
     atomic_store_release(&runtime_events_enabled, 0);
 }
 
-/* Stop-the-world which calls the teardown code */
-static void stw_teardown_runtime_events(
-  caml_domain_state *domain_state,
-  void *remove_file_data, int num_participating,
-  caml_domain_state **participating_domains)
-{
-  caml_global_barrier();
-  if (participating_domains[0] == domain_state) {
-    int remove_file = *(int*)remove_file_data;
-    runtime_events_teardown_from_stw_single(remove_file);
-  }
-  caml_global_barrier();
-}
-
-
 void caml_runtime_events_post_fork(void) {
   /* We are here in the child process after a call to fork (which can only
      happen when there is a single domain) and no mutator code that can spawn a
@@ -220,11 +201,13 @@ void caml_runtime_events_post_fork(void) {
   }
 }
 
-/* Return the current location for the ring buffers of this process. This is
-  used in the consumer to read the ring buffers of the current process */
+/* Return the path of the ring buffers file of this process, or NULL
+   if runtime events are not enabled. This is used in the consumer to
+   read the ring buffers of the current process. Always returns a
+   freshly-allocated string. */
 char_os* caml_runtime_events_current_location(void) {
   if( atomic_load_acquire(&runtime_events_enabled) ) {
-    return current_ring_loc;
+    return caml_stat_strdup_noexc_os(current_ring_loc);
   } else {
     return NULL;
   }
@@ -255,11 +238,11 @@ void caml_runtime_events_destroy(void) {
 static void runtime_events_create_from_stw_single(void) {
   /* Don't initialise runtime_events twice */
   if (!atomic_load_acquire(&runtime_events_enabled)) {
-    int ret, ring_headers_length, ring_data_length;
+    int ring_headers_length, ring_data_length;
 #ifdef _WIN32
     DWORD pid = GetCurrentProcessId();
 #else
-    int ring_fd;
+    int ring_fd, ret;
     long int pid = getpid();
 #endif
 
@@ -276,7 +259,7 @@ static void runtime_events_create_from_stw_single(void) {
     current_ring_total_size =
         RUNTIME_EVENTS_MAX_CUSTOM_EVENTS *
           sizeof(struct runtime_events_custom_event) +
-        Max_domains * (ring_size_words * sizeof(uint64_t) +
+        caml_params->max_domains * (ring_size_words * sizeof(uint64_t) +
                         sizeof(struct runtime_events_buffer_header)) +
         sizeof(struct runtime_events_metadata_header);
 
@@ -293,9 +276,13 @@ static void runtime_events_create_from_stw_single(void) {
 
     if (ring_file_handle == INVALID_HANDLE_VALUE) {
       char* ring_loc_u8 = caml_stat_strdup_of_os(current_ring_loc);
-      caml_fatal_error("Couldn't open ring buffer loc: %s",
-                        ring_loc_u8);
-      caml_stat_free(ring_loc_u8);
+      if (ring_loc_u8) {
+        caml_fatal_error("Couldn't open ring buffer file: %s",
+                         ring_loc_u8);
+        caml_stat_free(ring_loc_u8);
+      } else {
+        caml_fatal_error("Couldn't open ring buffer file");
+      }
     }
 
     ring_handle = CreateFileMapping(
@@ -350,12 +337,12 @@ static void runtime_events_create_from_stw_single(void) {
     close(ring_fd);
 #endif
     ring_headers_length =
-        Max_domains * sizeof(struct runtime_events_buffer_header);
+        caml_params->max_domains * sizeof(struct runtime_events_buffer_header);
     ring_data_length =
-        Max_domains * ring_size_words * sizeof(uint64_t);
+        caml_params->max_domains * ring_size_words * sizeof(uint64_t);
 
     current_metadata->version = RUNTIME_EVENTS_VERSION;
-    current_metadata->max_domains = Max_domains;
+    current_metadata->max_domains = caml_params->max_domains;
     current_metadata->ring_header_size_bytes =
         sizeof(struct runtime_events_buffer_header);
     current_metadata->ring_size_bytes =
@@ -372,9 +359,11 @@ static void runtime_events_create_from_stw_single(void) {
       current_metadata->data_offset + ring_data_length;
 
 
-    for (int domain_num = 0; domain_num < Max_domains; domain_num++) {
+    for (int domain_num = 0; domain_num < caml_params->max_domains;
+         domain_num++) {
       /* we initialise each ring's metadata. We use the offset to the headers
-        and then find the slot for each of domain in Max_domains */
+         and then find the slot for each of domain in caml_params->max_domains
+         */
       struct runtime_events_buffer_header *ring_buffer =
           (struct runtime_events_buffer_header
                 *)((char *)current_metadata +
@@ -387,7 +376,8 @@ static void runtime_events_create_from_stw_single(void) {
 
     // at the same instant: snapshot user_events list and set
     // runtime_events_enabled to 1
-    caml_plat_lock(&user_events_lock);
+    /* calling from STW */
+    caml_plat_lock_blocking(&user_events_lock);
     value current_user_event = user_events;
     atomic_store_release(&runtime_events_enabled, 1);
     caml_plat_unlock(&user_events_lock);
@@ -407,18 +397,40 @@ static void runtime_events_create_from_stw_single(void) {
   }
 }
 
+/* create/teardown STWs
+
+   The STW API does have an enter barrier before the handler code is
+   run, however, the enter barrier itself calls the runtime events API
+   after arrival, which may otherwise race with code inside the STW
+   section. Thus, the barrier in the STWs below is needed both to
+   ensure that all domains have actually reached the handler before we
+   start/stop (to avoid the aforementioned race), and of course to
+   ensure that the setup/teardown is observed by all domains returning
+   from the STW. */
+
+/* Stop the world section which calls [runtime_events_create_raw], used when we
+   can't be sure there is only a single domain running. */
 static void stw_create_runtime_events(
   caml_domain_state *domain_state, void *unused,
   int num_participating,
   caml_domain_state **participating_domains)
 {
-  caml_global_barrier();
-
-  /* Only do this on one domain */
-  if (participating_domains[0] == domain_state) {
+  /* Everyone must be stopped for starting and stopping runtime_events */
+  Caml_global_barrier_if_final(num_participating) {
     runtime_events_create_from_stw_single();
   }
-  caml_global_barrier();
+}
+
+/* Stop-the-world which calls the teardown code */
+static void stw_teardown_runtime_events(
+  caml_domain_state *domain_state,
+  void *remove_file_data, int num_participating,
+  caml_domain_state **participating_domains)
+{
+  Caml_global_barrier_if_final(num_participating) {
+    int remove_file = *(int*)remove_file_data;
+    runtime_events_teardown_from_stw_single(remove_file);
+  }
 }
 
 CAMLexport void caml_runtime_events_start(void) {
@@ -447,6 +459,16 @@ CAMLexport void caml_runtime_events_resume(void) {
   }
 }
 
+static inline int ring_is_active(void) {
+    return
+      atomic_load_relaxed(&runtime_events_enabled)
+      && !atomic_load_relaxed(&runtime_events_paused);
+}
+
+CAMLexport int caml_runtime_events_are_active(void) {
+  return (ring_is_active ());
+}
+
 /* Make the three functions above callable from OCaml */
 
 CAMLprim value caml_ml_runtime_events_start(value vunit) {
@@ -460,6 +482,28 @@ CAMLprim value caml_ml_runtime_events_pause(value vunit) {
 CAMLprim value caml_ml_runtime_events_resume(value vunit) {
   caml_runtime_events_resume(); return Val_unit;
 }
+
+CAMLprim value caml_ml_runtime_events_path(value vunit) {
+  CAMLparam0();
+  CAMLlocal1 (res);
+  res = Val_none;
+  if (atomic_load_acquire(&runtime_events_enabled)) {
+    res = caml_alloc_small(1, Tag_some);
+    /* The allocation might GC, which could allow another domain to
+     * nuke current_ring_loc, so we check again. */
+    if (atomic_load_acquire(&runtime_events_enabled)) {
+      Field(res, 0) = caml_copy_string_of_os(current_ring_loc);
+    } else {
+      res = Val_none;
+    }
+  }
+  CAMLreturn(res);
+}
+
+CAMLprim value caml_ml_runtime_events_are_active(void) {
+  return Val_bool(caml_runtime_events_are_active());
+}
+
 
 static struct runtime_events_buffer_header *get_ring_buffer_by_domain_id
                                                               (int domain_id) {
@@ -566,12 +610,6 @@ static void write_to_ring(ev_category category, ev_message_type type,
 
 /* Functions for putting runtime data on to the runtime_events */
 
-static inline int ring_is_active(void) {
-    return
-      atomic_load_relaxed(&runtime_events_enabled)
-      && !atomic_load_relaxed(&runtime_events_paused);
-}
-
 void caml_ev_begin(ev_runtime_phase phase) {
   if ( ring_is_active() ) {
     write_to_ring(EV_RUNTIME, (ev_message_type){.runtime=EV_BEGIN}, phase, 0,
@@ -620,15 +658,13 @@ void caml_ev_alloc(uint64_t sz) {
 }
 
 void caml_ev_alloc_flush(void) {
-  int i;
-
   if ( !ring_is_active() )
     return;
 
   write_to_ring(EV_RUNTIME, (ev_message_type){.runtime=EV_ALLOC}, 0,
                   RUNTIME_EVENTS_NUM_ALLOC_BUCKETS, alloc_buckets, 0);
 
-  for (i = 1; i < RUNTIME_EVENTS_NUM_ALLOC_BUCKETS; i++) {
+  for (int i = 1; i < RUNTIME_EVENTS_NUM_ALLOC_BUCKETS; i++) {
     alloc_buckets[i] = 0;
   }
 }
@@ -681,7 +717,13 @@ CAMLprim value caml_runtime_events_user_register(value event_name,
   Field(event, 3) = event_tag;
 
 
-  caml_plat_lock(&user_events_lock);
+  /* Pre-allocate to avoid STW while holding [user_events_lock]. */
+  list_item = caml_alloc_small(2, 0);
+
+  /* [user_events_lock] can be acquired during STW, so we must use
+     caml_plat_lock_blocking and be careful to avoid triggering any
+     STW while holding it */
+  caml_plat_lock_blocking(&user_events_lock);
   // critical section: when we update the user_events list we need to make sure
   // it is not updated while we construct the pointer to the next element
 
@@ -691,7 +733,6 @@ CAMLprim value caml_runtime_events_user_register(value event_name,
   }
 
   // event is added to the list of known events
-  list_item = caml_alloc_small(2, 0);
   Field(list_item, 0) = event;
   Field(list_item, 1) = user_events;
   caml_modify_generational_global_root(&user_events, list_item);
@@ -701,9 +742,10 @@ CAMLprim value caml_runtime_events_user_register(value event_name,
   CAMLreturn(event);
 }
 
-CAMLprim value caml_runtime_events_user_write(value event, value event_content)
+CAMLprim value caml_runtime_events_user_write(
+  value write_buffer, value event, value event_content)
 {
-  CAMLparam2(event, event_content);
+  CAMLparam3(write_buffer, event, event_content);
   CAMLlocal3(event_id, event_type, res);
 
   if ( !ring_is_active() )
@@ -734,21 +776,12 @@ CAMLprim value caml_runtime_events_user_write(value event, value event_content)
     value record = Field(event_type, 0);
     value serializer = Field(record, 0);
 
-    caml_plat_lock(&write_buffer_lock);
+    res = caml_callback2(serializer, write_buffer, event_content);
 
-    if (write_buffer == Val_none) {
-      write_buffer = caml_alloc_string(RUNTIME_EVENTS_MAX_MSG_LENGTH);
-      caml_register_generational_global_root(&write_buffer);
-    }
-
-    res = caml_callback2_exn(serializer, write_buffer, event_content);
-
-    if (Is_exception_result(res)) {
-      caml_plat_unlock(&write_buffer_lock);
-
-      res = Extract_exception(res);
-      caml_raise(res);
-    }
+    /* Need to check whether the ring is active again as the ring might
+     * potentially have been destroyed during the callback. */
+    if ( !ring_is_active() )
+      CAMLreturn(Val_unit);
 
     uintnat len_bytes = Int_val(res);
     uintnat len_64bit_word = (len_bytes + sizeof(uint64_t)) / sizeof(uint64_t);
@@ -757,8 +790,6 @@ CAMLprim value caml_runtime_events_user_write(value event, value event_content)
     write_to_ring(EV_USER, (ev_message_type){.user=EV_USER_MSG_TYPE_CUSTOM},
       Int_val(event_id), len_64bit_word, (uint64_t *) Bytes_val(write_buffer),
       0);
-
-    caml_plat_unlock(&write_buffer_lock);
 
   } else {
     // Unit | Int | Span
@@ -807,7 +838,7 @@ CAMLexport value caml_runtime_events_user_resolve(
   CAMLlocal3(event, cur_event_name, ml_event_name);
 
   // TODO: it might be possible to atomic load instead
-  caml_plat_lock(&user_events_lock);
+  caml_plat_lock_blocking(&user_events_lock);
   value current_user_event = user_events;
   caml_plat_unlock(&user_events_lock);
 

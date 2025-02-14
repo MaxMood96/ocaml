@@ -50,8 +50,8 @@ module Typedtree_search =
 
     let iter_val_pattern = function
       | Typedtree.Tpat_any -> None
-      | Typedtree.Tpat_var (name, _)
-      | Typedtree.Tpat_alias (_, name, _)  -> Some (Name.from_ident name)
+      | Typedtree.Tpat_var (name, _, _)
+      | Typedtree.Tpat_alias (_, name, _, _, _)  -> Some (Name.from_ident name)
       | Typedtree.Tpat_tuple _ -> None (* FIXME when we will handle tuples *)
       | _ -> None
 
@@ -77,7 +77,8 @@ module Typedtree_search =
           | ext :: _ -> Hashtbl.add table (X (Name.from_ident ext.ext_id)) tt
         end
       | Typedtree.Tstr_exception ext ->
-          Hashtbl.add table (E (Name.from_ident ext.tyexn_constructor.ext_id)) tt
+          Hashtbl.add table (E (Name.from_ident ext.tyexn_constructor.ext_id))
+            tt
       | Typedtree.Tstr_type (rf, ident_type_decl_list) ->
           List.iter
             (fun td ->
@@ -251,24 +252,24 @@ module Analyser =
     let tt_param_info_from_pattern env f_desc pat =
       let rec iter_pattern pat =
         match pat.pat_desc with
-          Typedtree.Tpat_var (ident, _) ->
+          Typedtree.Tpat_var (ident, _, _) ->
             let name = Name.from_ident ident in
             Simple_name { sn_name = name ;
                           sn_text = f_desc name ;
                           sn_type = Odoc_env.subst_type env pat.pat_type
                         }
 
-        | Typedtree.Tpat_alias (pat, _, _) ->
+        | Typedtree.Tpat_alias (pat, _, _, _, _) ->
             iter_pattern pat
 
         | Typedtree.Tpat_tuple patlist ->
             Tuple
-              (List.map iter_pattern patlist,
+              (List.map (fun (_, p) -> iter_pattern p) patlist,
                Odoc_env.subst_type env pat.pat_type)
 
         | Typedtree.Tpat_construct (_, cons_desc, _, _) when
             (* we give a name to the parameter only if it is unit *)
-            Path.same (Btype.cstr_type_path cons_desc) Predef.path_unit
+            Path.same (Data_types.cstr_res_type_path cons_desc) Predef.path_unit
           ->
             (* a () argument, it never has description *)
             Simple_name { sn_name = "()" ;
@@ -334,7 +335,7 @@ module Analyser =
        let (pat, exp) = pat_exp in
        let comment_opt = Odoc_sig.analyze_alerts comment_opt attrs in
        match pat.pat_desc with
-       | Tpat_var (ident, _) | Tpat_alias (_, ident, _) ->
+       | Tpat_var (ident, _, _) | Tpat_alias (_, ident, _, _, _) ->
           begin match exp.exp_desc with
           | Texp_function (params, body) ->
 
@@ -673,11 +674,11 @@ module Analyser =
               a default value. In this case, we look for the good parameter pattern *)
            let (parameter, next_tt_class_exp) =
              match pat.Typedtree.pat_desc with
-               Typedtree.Tpat_var (ident, _) when Name.from_ident ident = "*opt*" ->
+               Typedtree.Tpat_var (ident, _, _) when Name.from_ident ident = "*opt*" ->
                  (
                   (* there must be a Tcl_let just after *)
                   match tt_class_expr2.Typedtree.cl_desc with
-                    Typedtree.Tcl_let (_, {vb_pat={pat_desc = Typedtree.Tpat_var (id,_) };
+                    Typedtree.Tcl_let (_, {vb_pat={pat_desc = Typedtree.Tpat_var (id,_,_) };
                                            vb_expr=exp} :: _, _, tt_class_expr3) ->
                       let name = Name.from_ident id in
                       let new_param = Simple_name
@@ -708,7 +709,7 @@ module Analyser =
             in
            (parameter :: params, k)
 
-      | (Parsetree.Pcl_apply (p_class_expr2, _), Tcl_apply (tt_class_expr2, exp_opt_optional_list)) ->
+      | (Parsetree.Pcl_apply (p_class_expr2, _), Tcl_apply (tt_class_expr2, arg_list)) ->
           let applied_name =
             (* we want an ident, or else the class applied will appear in the form object ... end,
                because if the class applied has no name, the code is kinda ugly, isn't it ? *)
@@ -723,13 +724,10 @@ module Analyser =
                 |  _ ->
                     Odoc_messages.object_end
           in
-          let param_exps = List.fold_left
-              (fun acc -> fun (_, exp_opt) ->
-                match exp_opt with
-                  None -> acc
-                | Some e -> acc @ [e])
-              []
-              exp_opt_optional_list
+          let param_exps = List.filter_map (function
+              | _, Omitted () -> None
+              | _, Arg e -> Some e)
+            arg_list
           in
           let param_types = List.map (fun e -> e.Typedtree.exp_type) param_exps in
           let params_code =
@@ -1845,7 +1843,7 @@ module Analyser =
        let (tree_structure, _) = typedtree in
        prepare_file source_file input_file;
        (* We create the t_module for this file. *)
-       let mod_name = Unit_info.modname_from_source source_file in
+       let mod_name = Unit_info.lax_modname_from_source source_file in
        let len, info_opt = Sig.preamble !file_name !file
            (fun x -> x.Parsetree.pstr_loc) parsetree in
       let info_opt = analyze_toplevel_alerts info_opt parsetree in

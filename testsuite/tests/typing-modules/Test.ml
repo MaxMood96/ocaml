@@ -119,11 +119,11 @@ Error: Multiple definition of the extension constructor name "Foo".
 module F(X : sig end) = struct let x = 3 end;;
 F.x;; (* fail *)
 [%%expect{|
-module F : functor (X : sig end) -> sig val x : int end
+module F : (X : sig end) -> sig val x : int end
 Line 2, characters 0-3:
 2 | F.x;; (* fail *)
     ^^^
-Error: The module F is a functor, it cannot have any components
+Error: The module "F" is a functor, it cannot have any components
 |}];;
 
 type t = ..;;

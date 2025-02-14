@@ -126,6 +126,17 @@ external readdir : string -> string array = "caml_sys_read_directory"
    in any specific order; they are not, in particular, guaranteed to
    appear in alphabetical order. *)
 
+val io_buffer_size: int
+(** Size of C buffers used by the runtime system and IO primitives of the [unix]
+    library.
+
+    Primitives that read from or write to values of type [string] or [bytes]
+    generally use an intermediate buffer of this size to avoid holding the
+    domain lock.
+
+    @since 5.4
+*)
+
 val interactive : bool ref
 [@@alert unsynchronized_access
     "The interactive status is a mutable global state."
@@ -207,6 +218,11 @@ external runtime_parameters : unit -> string = "caml_runtime_parameters"
 (** Return the value of the runtime parameters, in the same format
     as the contents of the [OCAMLRUNPARAM] environment variable.
     @since 4.03 *)
+
+external poll_actions : unit -> unit = "%poll"
+(** Run any pending runtime actions, such as minor collections, major
+    GC slices, signal handlers, finalizers, or memprof callbacks.
+    @since 5.3 *)
 
 
 (** {1 Signal handling} *)
@@ -407,7 +423,9 @@ external opaque_identity : 'a -> 'a = "%opaque"
 (** For the purposes of optimization, [opaque_identity] behaves like an
     unknown (and thus possibly side-effecting) function.
 
-    At runtime, [opaque_identity] disappears altogether.
+    At runtime, [opaque_identity] disappears altogether.  However, it does
+    prevent the argument from being garbage collected until the location
+    where the call would have occurred.
 
     A typical use of this function is to prevent pure computations from being
     optimized away in benchmarking loops.  For example:

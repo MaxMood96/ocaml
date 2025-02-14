@@ -263,8 +263,9 @@ let package_files ~ppf_dump initial_env files targetcmx ~backend =
         try Load_path.find f
         with Not_found -> raise(Error(File_not_found f)))
       files in
-  let cmi = Unit_info.(companion_cmi @@ Artifact.from_filename targetcmx) in
-  let obj = Unit_info.companion_obj cmi in
+  let cmx = Unit_info.Artifact.from_filename targetcmx in
+  let cmi = Unit_info.companion_cmi cmx in
+  let obj = Unit_info.companion_obj cmx in
   (* Set the name of the current "input" *)
   Location.input_name := targetcmx;
   (* Set the name of the current compunit *)
@@ -280,21 +281,21 @@ let package_files ~ppf_dump initial_env files targetcmx ~backend =
 
 (* Error report *)
 
-open Format
+open Format_doc
 module Style = Misc.Style
 
-let report_error ppf = function
+let report_error_doc ppf = function
     Illegal_renaming(name, file, id) ->
       fprintf ppf "Wrong file naming: %a@ contains the code for\
                    @ %a when %a was expected"
-        (Style.as_inline_code Location.print_filename) file
+        Location.Doc.quoted_filename file
         Style.inline_code name Style.inline_code id
   | Forward_reference(file, ident) ->
       fprintf ppf "Forward reference to %a in file %a" Style.inline_code ident
-        (Style.as_inline_code Location.print_filename) file
+        Location.Doc.quoted_filename file
   | Wrong_for_pack(file, path) ->
       fprintf ppf "File %a@ was not compiled with the %a option"
-        (Style.as_inline_code Location.print_filename) file
+        Location.Doc.quoted_filename file
         Style.inline_code ("-for-pack " ^ path)
   | File_not_found file ->
       fprintf ppf "File %a not found" Style.inline_code file
@@ -306,6 +307,8 @@ let report_error ppf = function
 let () =
   Location.register_error_of_exn
     (function
-      | Error err -> Some (Location.error_of_printer_file report_error err)
+      | Error err -> Some (Location.error_of_printer_file report_error_doc err)
       | _ -> None
     )
+
+let report_error = Format_doc.compat report_error_doc

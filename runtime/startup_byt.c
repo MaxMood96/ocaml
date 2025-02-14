@@ -23,10 +23,11 @@
 #include <string.h>
 #include <fcntl.h>
 #include "caml/config.h"
-#ifdef HAS_UNISTD
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 #ifdef _WIN32
+#include <io.h>
 #include <process.h>
 #endif
 #include "caml/alloc.h"
@@ -74,7 +75,7 @@
 static char magicstr[EXEC_MAGIC_LENGTH+1];
 
 /* Print the specified error message followed by an end-of-line and exit */
-static void error(char *msg, ...)
+static void error(const char *msg, ...)
 {
   va_list ap;
   va_start(ap, msg);
@@ -93,7 +94,7 @@ static void fixup_endianness_trailer(uint32_t * p)
 #endif
 }
 
-static int read_trailer(int fd, struct exec_trailer *trail)
+int caml_read_trailer(int fd, struct exec_trailer *trail)
 {
   if (lseek(fd, (long) -TRAILER_SIZE, SEEK_END) == -1)
     return BAD_BYTECODE;
@@ -124,12 +125,12 @@ int caml_attempt_open(char_os **name, struct exec_trailer *trail,
 
   truename = caml_search_exe_in_path(*name);
   u8 = caml_stat_strdup_of_os(truename);
-  caml_gc_message(0x100, "Opening bytecode executable %s\n", u8);
+  CAML_GC_MESSAGE(STARTUP, "Opening bytecode executable %s\n", u8);
   caml_stat_free(u8);
   fd = open_os(truename, O_RDONLY | O_BINARY);
   if (fd == -1) {
     caml_stat_free(truename);
-    caml_gc_message(0x100, "Cannot open file\n");
+    CAML_GC_MESSAGE(STARTUP, "Cannot open file\n");
     if (errno == EMFILE)
       return NO_FDS;
     else
@@ -140,15 +141,15 @@ int caml_attempt_open(char_os **name, struct exec_trailer *trail,
     if (err < 2 || (buf [0] == '#' && buf [1] == '!')) {
       close(fd);
       caml_stat_free(truename);
-      caml_gc_message(0x100, "Rejected #! script\n");
+      CAML_GC_MESSAGE(STARTUP, "Rejected #! script\n");
       return BAD_BYTECODE;
     }
   }
-  err = read_trailer(fd, trail);
+  err = caml_read_trailer(fd, trail);
   if (err != 0) {
     close(fd);
     caml_stat_free(truename);
-    caml_gc_message(0x100, "Not a bytecode executable\n");
+    CAML_GC_MESSAGE(STARTUP, "Not a bytecode executable\n");
     return err;
   }
   *name = truename;
@@ -159,7 +160,7 @@ int caml_attempt_open(char_os **name, struct exec_trailer *trail,
 
 void caml_read_section_descriptors(int fd, struct exec_trailer *trail)
 {
-  int toc_size, i;
+  int toc_size;
 
   toc_size = trail->num_sections * 8;
   trail->section = caml_stat_alloc(toc_size);
@@ -167,7 +168,7 @@ void caml_read_section_descriptors(int fd, struct exec_trailer *trail)
   if (read(fd, (char *) trail->section, toc_size) != toc_size)
     caml_fatal_error("cannot read section table");
   /* Fixup endianness of lengths */
-  for (i = 0; i < trail->num_sections; i++)
+  for (int i = 0; i < trail->num_sections; i++)
     fixup_endianness_trailer(&(trail->section[i].len));
 }
 
@@ -176,13 +177,12 @@ void caml_read_section_descriptors(int fd, struct exec_trailer *trail)
    found with that name. */
 
 int32_t caml_seek_optional_section(int fd, struct exec_trailer *trail,
-                                   char *name)
+                                   const char *name)
 {
   long ofs;
-  int i;
 
   ofs = TRAILER_SIZE + trail->num_sections * 8;
-  for (i = trail->num_sections - 1; i >= 0; i--) {
+  for (int i = trail->num_sections - 1; i >= 0; i--) {
     ofs += trail->section[i].len;
     if (strncmp(trail->section[i].name, name, 4) == 0) {
       lseek(fd, -ofs, SEEK_END);
@@ -195,7 +195,8 @@ int32_t caml_seek_optional_section(int fd, struct exec_trailer *trail,
 /* Position fd at the beginning of the section having the given name.
    Return the length of the section data in bytes. */
 
-int32_t caml_seek_section(int fd, struct exec_trailer *trail, char *name)
+int32_t caml_seek_section(int fd, struct exec_trailer *trail,
+                          const char *name)
 {
   int32_t len = caml_seek_optional_section(fd, trail, name);
   if (len == -1)
@@ -206,13 +207,14 @@ int32_t caml_seek_section(int fd, struct exec_trailer *trail, char *name)
 /* Read and return the contents of the section having the given name.
    Add a terminating 0.  Return NULL if no such section. */
 
-static char * read_section(int fd, struct exec_trailer *trail, char *name)
+static char * read_section(int fd, struct exec_trailer *trail,
+                           const char *name)
 {
   int32_t len;
   char * data;
 
   len = caml_seek_optional_section(fd, trail, name);
-  if (len == -1) return NULL;
+  if (len < 0) return NULL; // (len == -1) widened to (len < 0) to help gcc
   data = caml_stat_alloc(len + 1);
   if (read(fd, data, len) != len)
     caml_fatal_error("error reading section %s", name);
@@ -223,7 +225,7 @@ static char * read_section(int fd, struct exec_trailer *trail, char *name)
 #ifdef _WIN32
 
 static char_os * read_section_to_os(int fd, struct exec_trailer *trail,
-                                    char *name)
+                                    const char *name)
 {
   int32_t len, wlen;
   char * data;
@@ -300,7 +302,7 @@ static void do_print_help(void)
 
 static int parse_command_line(char_os **argv)
 {
-  int i, j, len, parsed;
+  int i, len, parsed;
   /* cast to make caml_params mutable; this assumes we are only called
      by one thread at startup */
   struct caml_params* params = (struct caml_params*)caml_params;
@@ -318,10 +320,10 @@ static int parse_command_line(char_os **argv)
         params->trace_level += 1; /* ignored unless DEBUG mode */
         break;
       case 'v':
-        atomic_store_relaxed(&caml_verb_gc, 0x001+0x004+0x008+0x010+0x020);
+        atomic_store_relaxed(&caml_verb_gc, CAML_GC_MSG_VERBOSE);
         break;
       case 'p':
-        for (j = 0; caml_names_of_builtin_cprim[j] != NULL; j++)
+        for (int j = 0; caml_names_of_builtin_cprim[j] != NULL; j++)
           printf("%s\n", caml_names_of_builtin_cprim[j]);
         exit(0);
         break;
@@ -378,8 +380,7 @@ static int parse_command_line(char_os **argv)
    freed, since the runtime will terminate after calling this. */
 static void do_print_config(void)
 {
-  int i;
-  char_os * dir;
+  const char_os * dir;
 
   /* Print the runtime configuration */
   printf("version: %s\n", OCAML_VERSION_STRING);
@@ -416,19 +417,15 @@ static void do_print_config(void)
          "false");
 #endif
   printf("no_naked_pointers: true\n");
-  printf("compression_supported: %s\n",
-#ifdef HAS_ZSTD
-         "true");
-#else
-         "false");
-#endif
   printf("reserved header bits: %d\n", HEADER_RESERVED_BITS);
   printf("exec_magic_number: %s\n", EXEC_MAGIC);
 
   /* Parse ld.conf and print the effective search path */
   puts("shared_libs_path:");
+  caml_decompose_path(&caml_shared_libs_path,
+                      caml_secure_getenv(T("CAML_LD_LIBRARY_PATH")));
   caml_parse_ld_conf();
-  for (i = 0; i < caml_shared_libs_path.size; i++) {
+  for (int i = 0; i < caml_shared_libs_path.size; i++) {
     dir = caml_shared_libs_path.contents[i];
     if (dir[0] == 0)
 #ifdef _WIN32
@@ -467,9 +464,6 @@ CAMLexport void caml_main(char_os **argv)
   /* Determine options */
   caml_parse_ocamlrunparam();
 
-#ifdef DEBUG
-  caml_gc_message (-1, "### OCaml runtime: debug mode ###\n");
-#endif
   if (!caml_startup_aux(/* pooling */ caml_params->cleanup_on_exit))
     return;
 
@@ -608,9 +602,6 @@ CAMLexport value caml_startup_code_exn(
   /* Determine options */
   caml_parse_ocamlrunparam();
 
-#ifdef DEBUG
-  caml_gc_message (-1, "### OCaml runtime: debug mode ###\n");
-#endif
   if (caml_params->cleanup_on_exit)
     pooling = 1;
   if (!caml_startup_aux(pooling))
@@ -624,6 +615,7 @@ CAMLexport value caml_startup_code_exn(
 #endif
   caml_init_custom_operations();
   caml_init_os_params();
+  caml_ext_table_init(&caml_shared_libs_path, 8);
 
   /* Initialize the abstract machine */
   caml_init_gc ();
@@ -660,7 +652,7 @@ CAMLexport value caml_startup_code_exn(
   caml_load_main_debug_info();
   /* ensure all globals are in major heap */
   caml_minor_collection();
-  /* Record the sections (for caml_get_section_table in meta.c) */
+  /* Record the sections (for caml_dynlink_get_bytecode_sections) */
   caml_init_section_table(section_table, section_table_size);
   /* Execute the program */
   caml_debugger(PROGRAM_START, Val_unit);

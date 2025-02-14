@@ -20,9 +20,15 @@ let err = Syntaxerr.ill_formed_ast
 
 let empty_record loc = err loc "Records cannot be empty."
 let invalid_tuple loc = err loc "Tuples must have at least 2 components."
+let empty_open_tuple_pat loc =
+  err loc "Open tuple patterns must have at least one component."
+let short_closed_tuple_pat loc =
+  err loc "Closed tuple patterns must have at least two components."
 let no_args loc = err loc "Function application with no argument."
 let empty_let loc = err loc "Let with no bindings."
 let empty_type loc = err loc "Type declarations cannot be empty."
+let empty_poly_binder loc =
+  err loc "Explicit universal type quantification cannot be empty."
 let complex_id loc = err loc "Functor application not allowed here."
 let module_type_substitution_missing_rhs loc =
   err loc "Module type substitution with no right hand side"
@@ -53,6 +59,7 @@ let iterator =
     | Ptyp_tuple ([] | [_]) -> invalid_tuple loc
     | Ptyp_package (_, cstrs) ->
       List.iter (fun (id, _) -> simple_longident id) cstrs
+    | Ptyp_poly([],_) -> empty_poly_binder loc
     | _ -> ()
   in
   let pat self pat =
@@ -65,7 +72,8 @@ let iterator =
     end;
     let loc = pat.ppat_loc in
     match pat.ppat_desc with
-    | Ppat_tuple ([] | [_]) -> invalid_tuple loc
+    | Ppat_tuple (([] | [_]), Closed) -> short_closed_tuple_pat loc
+    | Ppat_tuple ([], Open) -> empty_open_tuple_pat loc
     | Ppat_record ([], _) -> empty_record loc
     | Ppat_construct (id, _) -> simple_longident id
     | Ppat_record (fields, _) ->

@@ -39,11 +39,10 @@
 #include "caml/startup_aux.h"
 #include "caml/sys.h"
 
-extern int caml_parser_trace;
 extern char caml_system__code_begin, caml_system__code_end;
 /* The two symbols above are defined in runtime/$ARCH.S.
    They use the old `__` separator convention because the new convention
-   gives `caml_system.code_begin`, which is not a valid C identifier. */
+   gives `caml_system$code_begin`, which is not a valid C identifier. */
 
 /* Initialize the static data and code area limits. */
 
@@ -53,11 +52,10 @@ static void init_segments(void)
 {
   extern struct segment caml_code_segments[];
   char * caml_code_area_start, * caml_code_area_end;
-  int i;
 
   caml_code_area_start = caml_code_segments[0].begin;
   caml_code_area_end = caml_code_segments[0].end;
-  for (i = 1; caml_code_segments[i].begin != 0; i++) {
+  for (int i = 1; caml_code_segments[i].begin != 0; i++) {
     if (caml_code_segments[i].begin < caml_code_area_start)
       caml_code_area_start = caml_code_segments[i].begin;
     if (caml_code_segments[i].end > caml_code_area_end)
@@ -87,15 +85,12 @@ extern void caml_install_invalid_parameter_handler(void);
 
 value caml_startup_common(char_os **argv, int pooling)
 {
-  char_os * exe_name, * proc_self_exe;
+  const char_os * exe_name, * proc_self_exe;
   value res;
 
   /* Determine options */
   caml_parse_ocamlrunparam();
 
-#ifdef DEBUG
-  caml_gc_message (-1, "### OCaml runtime: debug mode ###\n");
-#endif
   if (caml_params->cleanup_on_exit)
     pooling = 1;
   if (!caml_startup_aux(pooling))

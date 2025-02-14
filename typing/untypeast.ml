@@ -88,10 +88,6 @@ Some notes:
 
 (** Utility functions. *)
 
-let string_is_prefix sub str =
-  let sublen = String.length sub in
-  String.length str >= sublen && String.sub str 0 sublen = sub
-
 let rec lident_of_path = function
   | Path.Pident id -> Longident.Lident (Ident.name id)
   | Path.Papply (p1, p2) ->
@@ -107,7 +103,9 @@ let rec extract_letop_patterns n pat =
   if n = 0 then pat, []
   else begin
     match pat.pat_desc with
-    | Tpat_tuple([first; rest]) ->
+    | Tpat_tuple([None, first; None, rest]) ->
+        (* Labels should always be None, from when [Texp_letop] are created in
+           [Typecore.type_expect] *)
         let next, others = extract_letop_patterns (n-1) rest in
         first, next :: others
     | _ ->
@@ -121,13 +119,13 @@ let rec extract_letop_patterns n pat =
 (** Mapping functions. *)
 
 let constant = function
-  | Const_char c -> Pconst_char c
-  | Const_string (s,loc,d) -> Pconst_string (s,loc,d)
-  | Const_int i -> Pconst_integer (Int.to_string i, None)
-  | Const_int32 i -> Pconst_integer (Int32.to_string i, Some 'l')
-  | Const_int64 i -> Pconst_integer (Int64.to_string i, Some 'L')
-  | Const_nativeint i -> Pconst_integer (Nativeint.to_string i, Some 'n')
-  | Const_float f -> Pconst_float (f,None)
+  | Const_char c -> Const.char c
+  | Const_string (s,loc,d) -> Const.string ?quotation_delimiter:d ~loc s
+  | Const_int i -> Const.integer (Int.to_string i)
+  | Const_int32 i -> Const.integer ~suffix:'l' (Int32.to_string i)
+  | Const_int64 i -> Const.integer ~suffix:'L' (Int64.to_string i)
+  | Const_nativeint i -> Const.integer ~suffix:'n' (Nativeint.to_string i)
+  | Const_float f -> Const.float f
 
 let attribute sub a = {
     attr_name = map_loc sub a.attr_name;
@@ -288,7 +286,8 @@ let pattern : type k . _ -> k T.general_pattern -> _ = fun sub pat ->
   match pat with
       { pat_extra=[Tpat_unpack, loc, _attrs]; pat_desc = Tpat_any; _ } ->
         Ppat_unpack { txt = None; loc  }
-    | { pat_extra=[Tpat_unpack, _, _attrs]; pat_desc = Tpat_var (_,name); _ } ->
+    | { pat_extra=[Tpat_unpack, _, _attrs];
+        pat_desc = Tpat_var (_,name, _); _ } ->
         Ppat_unpack { name with txt = Some name.txt }
     | { pat_extra=[Tpat_type (_path, lid), _, _attrs]; _ } ->
         Ppat_type (map_loc sub lid)
@@ -298,7 +297,7 @@ let pattern : type k . _ -> k T.general_pattern -> _ = fun sub pat ->
     | _ ->
     match pat.pat_desc with
       Tpat_any -> Ppat_any
-    | Tpat_var (id, name) ->
+    | Tpat_var (id, name, _) ->
         begin
           match (Ident.name id).[0] with
             'A'..'Z' ->
@@ -311,15 +310,16 @@ let pattern : type k . _ -> k T.general_pattern -> _ = fun sub pat ->
        The compiler transforms (x:t) into (_ as x : t).
        This avoids transforming a warning 27 into a 26.
      *)
-    | Tpat_alias ({pat_desc = Tpat_any; pat_loc}, _id, name)
+    | Tpat_alias ({pat_desc = Tpat_any; pat_loc}, _id, name, _, _ty)
          when pat_loc = pat.pat_loc ->
        Ppat_var name
 
-    | Tpat_alias (pat, _id, name) ->
+    | Tpat_alias (pat, _id, name, _, _ty) ->
         Ppat_alias (sub.pat sub pat, name)
     | Tpat_constant cst -> Ppat_constant (constant cst)
     | Tpat_tuple list ->
-        Ppat_tuple (List.map (sub.pat sub) list)
+        Ppat_tuple
+          (List.map (fun (label, p) -> label, sub.pat sub p) list, Closed)
     | Tpat_construct (lid, _, args, vto) ->
         let tyo =
           match vto with
@@ -334,7 +334,10 @@ let pattern : type k . _ -> k T.general_pattern -> _ = fun sub pat ->
           match args with
             []    -> None
           | [arg] -> Some (sub.pat sub arg)
-          | args  -> Some (Pat.tuple ~loc (List.map (sub.pat sub) args))
+          | args  ->
+              Some (Pat.tuple ~loc
+                      (List.map (fun p -> None, sub.pat sub p) args)
+                      Closed)
         in
         Ppat_construct (map_loc sub lid,
           match tyo, arg with
@@ -347,7 +350,7 @@ let pattern : type k . _ -> k T.general_pattern -> _ = fun sub pat ->
     | Tpat_record (list, closed) ->
         Ppat_record (List.map (fun (lid, _, pat) ->
             map_loc sub lid, sub.pat sub pat) list, closed)
-    | Tpat_array list -> Ppat_array (List.map (sub.pat sub) list)
+    | Tpat_array (_mut, list) -> Ppat_array (List.map (sub.pat sub) list)
     | Tpat_lazy p -> Ppat_lazy (sub.pat sub p)
 
     | Tpat_exception p -> Ppat_exception (sub.pat sub p)
@@ -444,17 +447,39 @@ let expression sub exp =
         Pexp_function (params, constraint_, body)
     | Texp_apply (exp, list) ->
         Pexp_apply (sub.expr sub exp,
-          List.fold_right (fun (label, expo) list ->
-              match expo with
-                None -> list
-              | Some exp -> (label, sub.expr sub exp) :: list
+          List.fold_right (fun (label, arg) list ->
+              match arg with
+              | Omitted () -> list
+              | Arg exp -> (label, sub.expr sub exp) :: list
           ) list [])
-    | Texp_match (exp, cases, _) ->
-      Pexp_match (sub.expr sub exp, List.map (sub.case sub) cases)
-    | Texp_try (exp, cases) ->
-        Pexp_try (sub.expr sub exp, List.map (sub.case sub) cases)
+    | Texp_match (exp, cases, eff_cases, _) ->
+      let merged_cases = List.map (sub.case sub) cases
+        @ List.map
+          (fun c ->
+            let uc = sub.case sub c in
+            let pat = { uc.pc_lhs
+                        (* XXX KC: The 2nd argument of Ppat_effect is wrong *)
+                        with ppat_desc = Ppat_effect (uc.pc_lhs, uc.pc_lhs) }
+            in
+            { uc with pc_lhs = pat })
+          eff_cases
+      in
+      Pexp_match (sub.expr sub exp, merged_cases)
+    | Texp_try (exp, exn_cases, eff_cases) ->
+        let merged_cases = List.map (sub.case sub) exn_cases
+        @ List.map
+          (fun c ->
+            let uc = sub.case sub c in
+            let pat = { uc.pc_lhs
+                        (* XXX KC: The 2nd argument of Ppat_effect is wrong *)
+                        with ppat_desc = Ppat_effect (uc.pc_lhs, uc.pc_lhs) }
+            in
+            { uc with pc_lhs = pat })
+          eff_cases
+        in
+        Pexp_try (sub.expr sub exp, merged_cases)
     | Texp_tuple list ->
-        Pexp_tuple (List.map (sub.expr sub) list)
+        Pexp_tuple (List.map (fun (lbl, e) -> lbl, sub.expr sub e) list)
     | Texp_construct (lid, _, args) ->
         Pexp_construct (map_loc sub lid,
           (match args with
@@ -462,7 +487,7 @@ let expression sub exp =
           | [ arg ] -> Some (sub.expr sub arg)
           | args ->
               Some
-                (Exp.tuple ~loc (List.map (sub.expr sub) args))
+                (Exp.tuple ~loc (List.map (fun e -> None, sub.expr sub e) args))
           ))
     | Texp_variant (label, expo) ->
         Pexp_variant (label, Option.map (sub.expr sub) expo)
@@ -478,7 +503,7 @@ let expression sub exp =
     | Texp_setfield (exp1, lid, _label, exp2) ->
         Pexp_setfield (sub.expr sub exp1, map_loc sub lid,
           sub.expr sub exp2)
-    | Texp_array list ->
+    | Texp_array (_mut, list) ->
         Pexp_array (List.map (sub.expr sub) list)
     | Texp_ifthenelse (exp1, exp2, expo) ->
         Pexp_ifthenelse (sub.expr sub exp1,
@@ -719,8 +744,8 @@ let class_expr sub cexpr =
         Pcl_apply (sub.class_expr sub cl,
           List.fold_right (fun (label, expo) list ->
               match expo with
-                None -> list
-              | Some exp -> (label, sub.expr sub exp) :: list
+              | Omitted () -> list
+              | Arg exp -> (label, sub.expr sub exp) :: list
           ) args [])
 
     | Tcl_let (rec_flat, bindings, _ivars, cl) ->
@@ -782,7 +807,8 @@ let core_type sub ct =
     | Ttyp_var s -> Ptyp_var s
     | Ttyp_arrow (label, ct1, ct2) ->
         Ptyp_arrow (label, sub.typ sub ct1, sub.typ sub ct2)
-    | Ttyp_tuple list -> Ptyp_tuple (List.map (sub.typ sub) list)
+    | Ttyp_tuple list ->
+        Ptyp_tuple (List.map (fun (l, typ) -> l, sub.typ sub typ) list)
     | Ttyp_constr (_path, lid, list) ->
         Ptyp_constr (map_loc sub lid,
           List.map (sub.typ sub) list)
@@ -805,8 +831,8 @@ let core_type sub ct =
 
 let class_structure sub cs =
   let rec remove_self = function
-    | { pat_desc = Tpat_alias (p, id, _s) }
-      when string_is_prefix "selfpat-" (Ident.name id) ->
+    | { pat_desc = Tpat_alias (p, id, _s, _, _ty) }
+      when String.starts_with ~prefix:"selfpat-" (Ident.name id) ->
         remove_self p
     | p -> p
   in
@@ -835,8 +861,8 @@ let object_field sub {of_loc; of_desc; of_attributes;} =
   Of.mk ~loc ~attrs desc
 
 and is_self_pat = function
-  | { pat_desc = Tpat_alias(_pat, id, _) } ->
-      string_is_prefix "self-" (Ident.name id)
+  | { pat_desc = Tpat_alias(_pat, id, _, _, _ty) } ->
+      String.starts_with ~prefix:"self-" (Ident.name id)
   | _ -> false
 
 (* [Typeclass] adds a [self] parameter to initializers and methods that isn't
